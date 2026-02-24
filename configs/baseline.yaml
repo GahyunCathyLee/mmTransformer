@@ -1,0 +1,74 @@
+# =========================
+# DATA
+# =========================
+data:
+  batch_size: 1024
+  num_workers: 16
+
+  train:
+    dataset_path: 'highD/baseline'
+    processed_data_path: 'highD/baseline/train.h5'   
+    processed_maps_path: 'highD/baseline/map.pkl'    
+    shuffle: true
+
+  val:
+    dataset_path: 'highD/baseline'
+    processed_data_path: 'highD/baseline/val.h5'     
+    processed_maps_path: 'highD/baseline/map.pkl'    
+    shuffle: false
+
+# =========================
+# MODEL
+# =========================
+model:
+  type: 'stacked_transformer'
+  
+  history_num_frames: 15
+  future_num_frames: 25
+  lane_length: 10
+
+  max_lane_num: 6      # MAX_LANES 
+  max_agent_num: 9     # MAX_AGENTS
+  
+  # 차원 설정
+  in_channels: 4         # baseline 에이전트 입력 피처 차원 (x, y, timestamp, mask)
+  lane_channels: 7       
+  out_channels: 50       # 미래 예측 프레임(25) * 2(x, y) = 50
+  
+  # 다중 경로 예측 설정
+  K: 6                   
+  queries: 6
+  num_guesses: 6
+  
+  # 트랜스포머 파라미터
+  queries_dim: 64
+  enc_dim: 64
+  aux_task: false
+  increasetime: 3
+
+  # mmTrans 전용 Subgraph (LaneNet) 파라미터
+  subgraph_width: 32
+  num_subgraph_layres: 2
+
+# =========================
+# TRAIN
+# =========================
+train:
+  device: cuda
+  seed: 42
+
+  epochs: 500
+  lr: 0.0003             
+  weight_decay: 0.0001
+
+  # loss weights (Regression vs Classification)
+  w_reg: 1.0     
+  w_cls: 1.0  
+
+  # scheduler
+  lr_schedule: cosine
+  warmup_steps: 500
+
+  # logging / ckpt
+  monitor: val_rmse
+  ckpt_dir: ckpts

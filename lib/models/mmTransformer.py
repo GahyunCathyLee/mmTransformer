@@ -135,10 +135,10 @@ class mmTrans(nn.Module):
         self.B = data['HISTORY'].shape[0]
 
         self.traj_valid_len = data['VALID_LEN'][:, 0]
-        self.max_agent_num = torch.max(self.traj_valid_len)
+        self.max_agent_num = data['HISTORY'].shape[1]
 
         self.lane_valid_len = data['VALID_LEN'][:, 1]
-        self.max_lane_num = torch.max(self.lane_valid_len)
+        self.max_lane_num = data['LANE'].shape[1]
 
         # preprocess
         pos = data['POS']

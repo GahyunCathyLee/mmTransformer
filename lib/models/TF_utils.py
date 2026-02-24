@@ -228,7 +228,7 @@ def attention(query, key, value, mask=None, dropout=None):
     # mask: [bs,1,1,num2] => dimension expansion
 
     if mask is not None:
-        scores = scores.masked_fill_(mask == 0, value=-1e9)
+        scores = scores.masked_fill_(mask == 0, value=-1e4)
     p_attn = torch.softmax(scores, dim=-1)
     if dropout is not None:
         p_attn = dropout(p_attn)
