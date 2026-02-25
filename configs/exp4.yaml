@@ -6,15 +6,15 @@ data:
   num_workers: 16
 
   train:
-    dataset_path: 'highD/baseline'
-    processed_data_path: 'highD/baseline/train.h5'   
-    processed_maps_path: 'highD/baseline/map.pkl'    
+    dataset_path: 'highD/exp4'
+    processed_data_path: 'highD/exp4/train.h5'   
+    processed_maps_path: 'highD/exp4/map.pkl'    
     shuffle: true
 
   val:
-    dataset_path: 'highD/baseline'
-    processed_data_path: 'highD/baseline/val.h5'     
-    processed_maps_path: 'highD/baseline/map.pkl'    
+    dataset_path: 'highD/exp4'
+    processed_data_path: 'highD/exp4/val.h5'     
+    processed_maps_path: 'highD/exp4/map.pkl'    
     shuffle: false
 
 # =========================
@@ -31,7 +31,7 @@ model:
   max_agent_num: 9     # MAX_AGENTS
   
   # 차원 설정
-  in_channels: 4         # baseline 에이전트 입력 피처 차원 (x, y, timestamp, mask)
+  in_channels: 11         # baseline 에이전트 입력 피처 차원 (x, y, timestamp, mask)
   lane_channels: 7       
   out_channels: 50       # 미래 예측 프레임(25) * 2(x, y) = 50
   
@@ -57,7 +57,7 @@ train:
   device: cuda
   seed: 42
 
-  epochs: 200
+  epochs: 300
   lr: 0.0003             
   weight_decay: 0.0001
 

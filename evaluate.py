@@ -9,6 +9,7 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 import argparse
 from torch.amp import autocast
+import time
 
 from lib.utils.utilities import load_config_data, load_model_class
 from lib.models.mmTransformer import mmTrans
@@ -165,6 +166,62 @@ def save_csv(result_dict, save_path):
 
 
 # ==============================================================================
+# 3. Inference Time Measurement Function
+# ==============================================================================
+def measure_inference_time(model, dataset, device, num_iters=10000):
+    """
+    Batch Size 1로 num_iters만큼 추론 시간을 측정합니다.
+    """
+    model.eval()
+    # Batch size 1로 하나의 샘플 추출
+    sample = dataset[0]
+    batch_data = {}
+    for k, v in sample.items():
+        if isinstance(v, torch.Tensor):
+            batch_data[k] = v.unsqueeze(0).to(device)
+
+    latencies = []
+    print(f"\n⏱️ Inference Time 측정 시작 (Iterations: {num_iters}, Batch Size: 1)")
+    
+    with torch.no_grad():
+        # Warm-up (100 iters)
+        for _ in range(100):
+            with autocast(device_type='cuda' if device.type == 'cuda' else 'cpu'):
+                _ = model(batch_data)
+        
+        # 실제 측정
+        for _ in tqdm(range(num_iters), desc="Measuring Latency"):
+            if device.type == 'cuda':
+                torch.cuda.synchronize()
+            
+            start_time = time.perf_counter()
+            
+            with autocast(device_type='cuda' if device.type == 'cuda' else 'cpu'):
+                _ = model(batch_data)
+            
+            if device.type == 'cuda':
+                torch.cuda.synchronize()
+            
+            end_time = time.perf_counter()
+            latencies.append((end_time - start_time) * 1000) # ms 단위 저장
+
+    latencies = np.array(latencies)
+    avg_t = np.mean(latencies)
+    min_t = np.min(latencies)
+    max_t = np.max(latencies)
+    std_t = np.std(latencies)
+
+    print(f"\n" + "="*50)
+    print(f" 🏁 Inference Time 결과 (Batch Size: 1)")
+    print(f"  - Average : {avg_t:.4f} ms")
+    print(f"  - Minimum : {min_t:.4f} ms")
+    print(f"  - Maximum : {max_t:.4f} ms")
+    print(f"  - Std Dev : {std_t:.4f} ms")
+    print("="*50 + "\n")
+    
+    return {'avg': avg_t, 'min': min_t, 'max': max_t}
+
+# ==============================================================================
 # 5. 평가 메인 함수
 # ==============================================================================
 def evaluate(args):
@@ -198,7 +255,7 @@ def evaluate(args):
         ckpt_path = args.checkpoint
     else:
         config_name = os.path.basename(args.config).replace('.yaml', '')
-        ckpt_dir    = cfg.get('train', {}).get('ckpt_dir', './checkpoints')
+        ckpt_dir    = cfg.get('train', {}).get('ckpt_dir', './ckpts')
         ckpt_path   = os.path.join(ckpt_dir, config_name, 'best.pt')
 
     if not os.path.isfile(ckpt_path):
@@ -221,6 +278,11 @@ def evaluate(args):
         num_workers=num_workers, pin_memory=True,
         prefetch_factor=4, persistent_workers=True,
     )
+
+    # --- Mode 1: Inference Time Measurement ---
+    if args.measure_time:
+        measure_inference_time(model, dataset, device, num_iters=10000)
+        return
 
     # ── 평가 루프 ─────────────────────────────────────────────────────────────
     metric_keys = ['minADE', 'minFDE', 'RMSE',
@@ -310,6 +372,8 @@ if __name__ == "__main__":
                         type=str, default="ckpts/baseline/best.pt",
                         help='체크포인트 경로 (.pt). 미지정 시 best.pt 자동 로드')
 
+    parser.add_argument('--measure_time', action='store_true', 
+                        help='Inference time을 측정 모드 (Batch size 1, 10000 iters)')
     # 결과 저장
     parser.add_argument('--save_csv',
                         action='store_true', default=True,
