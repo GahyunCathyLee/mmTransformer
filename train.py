@@ -2,17 +2,37 @@ import os
 import pickle
 import numpy as np
 import h5py
+from pathlib import Path
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 import argparse
 from torch.amp import autocast, GradScaler
+from torch.optim.lr_scheduler import OneCycleLR
 import torch.backends.cudnn as cudnn
+from torch.utils.tensorboard import SummaryWriter # 💡 추가
+from datetime import datetime
+from contextlib import nullcontext
 
-from lib.utils.utilities import load_config_data, save_checkpoint, load_model_class
+from lib.utils.utilities import load_config_data
 from lib.models.mmTransformer import mmTrans
 from lib.models.TF_version.stacked_transformer import STF
+
+# [0:dx, 1:dy, 2:dvx, 3:dvy, 4:ax, 5:ay, 6:lc_state, 7:dx_time, 8:gate]
+EXTRA_FEATURE_MAP = {
+    'baseline': [0, 1],              
+    'exp1': [0, 1, 6, 7],                  
+    'exp2': [0, 1, 4, 5, 6, 7, 8],               
+    'exp3': [0, 1, 2, 3, 4, 5, 8],               
+    'exp4': [0, 1, 2, 3, 4, 5, 6, 7, 8],   
+    'exp5': [0, 1, 6, 7, 8],
+    'exp6': [6, 7],
+    'exp7': [4, 5, 6, 7, 8],
+    'exp8': [0, 1, 6, 8],
+    'exp9': [0, 1, 8]            
+}
+
 
 # ==============================================================================
 # 1. Dataset 구성 (In-Memory 캐싱 적용)
@@ -135,106 +155,118 @@ def print_model_size(model):
 
 def train(args):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
-    # 💡 최적화 1: GPU 연산 알고리즘 최적화
-    if device.type == 'cuda':
-        torch.backends.cudnn.benchmark = True 
-        
     cfg = load_config_data(args.config)
-    stacked_transformer_class = STF
     
-    # 설정값 병합 및 모델 파라미터 강제 고정
-    model_cfg = {}
-    for key in ['data', 'model', 'train']:
-        if key in cfg and isinstance(cfg[key], dict):
-            model_cfg.update(cfg[key])
-    for k, v in cfg.items():
-        if not isinstance(v, dict):
-            model_cfg[k] = v
+    # ✅ 2. 실험 모드 및 채널 수 자동 계산
+    # Config에서 feature_mode를 가져오고, 없으면 baseline 사용
+    feature_mode = cfg.get('exp', {}).get('feature_mode', 'baseline')
+    num_extra = len(EXTRA_FEATURE_MAP[feature_mode])
+    in_channels = 4 + num_extra  # 기본(x,y,t,m) + 추가 피처 개수
     
-    # 💡 텐서 사이즈 충돌 방지 고정
+    # ✅ 3. 경로 설정 자동화
+    data_dir = Path(args.data_dir) / feature_mode
+    save_dir = Path(cfg.get('train', {}).get('ckpt_dir', './checkpoints')) / feature_mode
+    save_dir.mkdir(parents=True, exist_ok=True)
+    best_path = save_dir / "best.pt"
+
+    log_time = datetime.now().strftime("%m%d-%H%M")
+    log_dir = Path("logs") / feature_mode / log_time
+    writer = SummaryWriter(log_dir=str(log_dir))
+    
+
+    print("=" * 50)
+    print(f"🚀 Experiment Mode : {feature_mode}")
+    print(f"📏 Input Channels  : {in_channels} (4 + {num_extra})")
+    print(f"📂 Data Directory  : {data_dir}")
+    print(f"💾 Save Directory  : {save_dir}")
+    print(f"📊 TensorBoard Log : {log_dir}")
+    print("=" * 50)
+
+    # 모델 설정 업데이트
+    model_cfg = cfg.get('model', {})
+    model_cfg['in_channels'] = in_channels
     model_cfg['max_lane_num'] = 6
     model_cfg['max_agent_num'] = 9
-    model_cfg['lane_channels'] = 7
-            
-    model = mmTrans(stacked_transformer_class, model_cfg).to(device)
+    
+    future_frames = model_cfg.get('future_num_frames', 25)
+    model_cfg['out_channels'] = future_frames * 2
+    
+    model = mmTrans(STF, model_cfg).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=float(cfg.get('train', {}).get('lr', 1e-4)))
+    
+    use_amp = cfg.get('train', {}).get('use_amp', True)
+    scaler = GradScaler('cuda') if use_amp else None
 
-    if args.resume:
-        config_name = os.path.basename(args.config).replace('.yaml', '')
-        ckpt_path = os.path.join(cfg.get('train', {}).get('ckpt_dir', './ckpts/baseline'), config_name, 'best.pt')
-        
-        if os.path.exists(ckpt_path):
-            checkpoint = torch.load(ckpt_path, map_location=device)
-            if 'model_state_dict' in checkpoint:
-                model.load_state_dict(checkpoint['model_state_dict'])
-            elif 'state_dict' in checkpoint:
-                model.load_state_dict(checkpoint['state_dict'])
-            elif 'model_state' in checkpoint:
-                model.load_state_dict(checkpoint['model_state'])
-            else:
-                model.load_state_dict(checkpoint)
-
-            print(f"🔄 [Resume] 가중치 복구가 완료되었습니다.")
-        else:
-            print(f"⚠️ [Warning] {ckpt_path}에 체크포인트가 없어 처음부터 학습을 시작합니다.")
-
-    # 💡 모델 내부 속성 강제 주입
-    model.max_lane_num = 6
-    model.max_agent_num = 9
+    train_dataset = HighDDataset(data_path=str(data_dir / 'train.h5'), map_path=str(data_dir / 'map.pkl'))
+    val_dataset = HighDDataset(data_path=str(data_dir / 'val.h5'), map_path=str(data_dir / 'map.pkl'))
     
-    print_model_size(model)
-    
-
-    base_lr = float(cfg.get('train', {}).get('lr', 1e-4))
-    lr = base_lr * 0.2 if args.resume else base_lr
-    
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    if args.resume:
-        print(f"📉 [LR Adjust] 학습을 재개하므로 학습률을 {base_lr} -> {lr}로 낮췄습니다.")
-    
-    # 💡 최적화 2: AMP Scaler 초기화 (최신 문법)
-    scaler = GradScaler('cuda')
-    
-    # 데이터셋 로드 (In-Memory 방식 권장)
-    base_dir = args.data_dir
-    train_dataset = HighDDataset(data_path=f'{base_dir}/train.h5', map_path=f'{base_dir}/map.pkl')
-    val_dataset = HighDDataset(data_path=f'{base_dir}/val.h5', map_path=f'{base_dir}/map.pkl')
-    
-    batch_size = cfg.get('data', {}).get('batch_size', 512)
-    num_workers = 32 
+    batch_size = cfg.get('data', {}).get('batch_size', 1024)
+    num_workers = cfg.get('data', {}).get('num_workers', 32)
+    num_epochs = cfg.get('train', {}).get('epochs', 500)
+    persistent_workers = cfg.get('train', {}).get('persistent_workers', True)
     
     train_loader = DataLoader(
         train_dataset, batch_size=batch_size, shuffle=True, 
-        num_workers=num_workers, pin_memory=True, prefetch_factor=4, persistent_workers=True
+        num_workers=num_workers, pin_memory=True, prefetch_factor=4, persistent_workers=persistent_workers
     )
     val_loader = DataLoader(
         val_dataset, batch_size=batch_size, shuffle=False, 
-        num_workers=num_workers, pin_memory=True, persistent_workers=True
+        num_workers=num_workers, pin_memory=True, persistent_workers=persistent_workers
     )
 
-    num_epochs = cfg.get('train', {}).get('epochs', 500)
-    
-    best_rmse = float('inf') 
-    config_name = os.path.basename(args.config).replace('.yaml', '')
-    save_dir = os.path.join(cfg.get('train', {}).get('ckpt_dir', './checkpoints'), config_name)
-    os.makedirs(save_dir, exist_ok=True)
+    total_steps = len(train_loader) * num_epochs
+
+    scheduler = OneCycleLR(
+        optimizer,
+        max_lr=float(cfg.get('train', {}).get('lr')),
+        total_steps=total_steps,
+        pct_start=0.1,    
+        anneal_strategy='cos',
+        div_factor=10,    
+        final_div_factor=100 
+    )
+
+    start_epoch = 1
+    best_rmse = float('inf')
+
+    # ✅ 4. 자동 Resume 로직 
+    if args.resume:
+        if best_path.exists():
+            print(f"🔄 [Resume] 기존 체크포인트 로드: {best_path}")
+            checkpoint = torch.load(best_path, map_location=device)
+            
+            # 가중치 복구 (다양한 키값 대응)
+            state_key = 'model_state_dict' if 'model_state_dict' in checkpoint else 'state_dict'
+            model.load_state_dict(checkpoint[state_key])
+            
+            if 'optimizer_state_dict' in checkpoint:
+                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            
+            start_epoch = checkpoint.get('epoch', 0) + 1
+            best_rmse = checkpoint.get('val_rmse', float('inf'))
+            print(f"✅ {checkpoint.get('epoch')} 에포크부터 재개합니다. (Best RMSE: {best_rmse:.4f})")
+        else:
+            print(f"⚠️ [Resume] 체크포인트를 찾을 수 없어 처음부터 학습을 시작합니다.")
 
     print(f"Start Training on {device} with AMP Enabled...\n")
     
-    for epoch in range(num_epochs):
+    for epoch in range(start_epoch, num_epochs + 1):
+        print(f"{'=' * 30}  Epoch {epoch}/{num_epochs}  {'=' * 30}")
         # --- [TRAIN PHASE] ---
         model.train()
         train_loss, train_ade, train_rmse = 0.0, 0.0, 0.0
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Train]")
+        pbar = tqdm(train_loader, desc=f"[Train]")
         
-        for batch_data in pbar:
+        for batch_idx, batch_data in enumerate(pbar):
             for k, v in batch_data.items():
                 if isinstance(v, torch.Tensor):
                     batch_data[k] = v.to(device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
 
-            with autocast(device_type='cuda'):
+            context = autocast(device_type='cuda') if use_amp else nullcontext()
+
+            with context:
                 pred, conf = model(batch_data)
                 
                 # Target Agent 추출
@@ -250,11 +282,23 @@ def train(args):
                     optimizer.zero_grad(set_to_none=True)
                     continue
             
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0) 
-            scaler.step(optimizer)
-            scaler.update()
+            if use_amp:
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0) 
+                scaler.step(optimizer)
+                scaler.update()
+
+                scheduler.step()
+            else:
+                loss.backward() # 일반적인 역전파
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+                scheduler.step()
+
+            curr_step = (epoch - 1) * len(train_loader) + batch_idx
+            writer.add_scalar('Train/Batch_Loss', loss.item(), curr_step)
+            writer.add_scalar('Train/Learning_Rate', optimizer.param_groups[0]['lr'], curr_step)
 
             # Metric 계산 (Best-of-K 기반)
             with torch.no_grad():
@@ -278,7 +322,8 @@ def train(args):
                     if isinstance(v, torch.Tensor):
                         batch_data[k] = v.to(device, non_blocking=True)
 
-                with autocast(device_type='cuda'):
+                context = autocast(device_type='cuda') if use_amp else nullcontext()
+                with context:
                     pred, conf = model(batch_data)
                     target_pred = pred[:, 0, ...] if pred.dim() == 5 else pred
                     target_conf = conf[:, 0, ...] if conf.dim() == 3 else conf
@@ -301,24 +346,34 @@ def train(args):
         avg_v_loss = val_loss / len(val_loader)
         avg_v_ade = val_ade / len(val_loader)
         avg_v_rmse = val_rmse / len(val_loader)
+
+        writer.add_scalar('Loss/Train_Epoch', train_loss / len(train_loader), epoch)
+        writer.add_scalar('Loss/Val_Epoch', avg_v_loss, epoch)
+        writer.add_scalar('Metric/Val_ADE', avg_v_ade, epoch)
+        writer.add_scalar('Metric/Val_RMSE', avg_v_rmse, epoch)
         
         print(f"Epoch [{epoch+1}] Val Loss: {avg_v_loss:.4f} | ADE: {avg_v_ade:.4f} | RMSE: {avg_v_rmse:.4f}")
 
         if avg_v_rmse < best_rmse:
             best_rmse = avg_v_rmse
-            save_path = os.path.join(save_dir, 'best.pt')
-            
-            save_checkpoint(save_path, model, optimizer, MR=best_rmse)
-            print(f"⭐ Best RMSE Updated! ({best_rmse:.4f}) Model saved to {save_path}")
-
-        print("-" * 30)
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'val_rmse': best_rmse,
+                'feature_mode': feature_mode
+            }, best_path)
+            print(f"⭐ Best RMSE Updated! ({best_rmse:.4f}) -> {best_path}")
         print()
+
+    writer.close()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', type=str, default='configs/baseline.yaml', help='path to config file')
-    parser.add_argument('--data_dir', type=str, default='highD/baseline', help='path to data folder containing h5 and map.pkl')
+    parser.add_argument('--data_dir', type=str, default='highD', help='path to data folder containing h5 and map.pkl')
     parser.add_argument('--resume', action='store_true', help='resume from best checkpoint')
     args = parser.parse_args()
     
     train(args)
+    

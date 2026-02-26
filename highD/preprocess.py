@@ -21,19 +21,25 @@ MAX_AGENTS = 9
 MAX_LANES = 6   
 LANE_PTS = 10    
 
+# [0:dx, 1:dy, 2:dvx, 3:dvy, 4:ax, 5:ay, 6:lc_state, 7:dx_time, 8:gate]
 EXTRA_FEATURE_MAP = {
-    'baseline': [],
-    'exp1': [4, 5],          # lc_state, dx_time
-    'exp2': [2, 3, 4, 5, 6], # ax, ay, lc_state, dx_time, gate
-    'exp3': [0, 1, 2, 3, 6], # dvx, dvy, ax, ay, gate
-    'exp4': [0, 1, 2, 3, 4, 5, 6] # All
+    'baseline': [0, 1],              
+    'exp1': [0, 1, 6, 7],                  
+    'exp2': [0, 1, 4, 5, 6, 7, 8],               
+    'exp3': [0, 1, 2, 3, 4, 5, 8],               
+    'exp4': [0, 1, 2, 3, 4, 5, 6, 7, 8],   
+    'exp5': [0, 1, 6, 7, 8],
+    'exp6': [6, 7],
+    'exp7': [4, 5, 6, 7, 8],
+    'exp8': [0, 1, 6, 8],
+    'exp9': [0, 1, 8]            
 }
 
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--raw_dir", type=str, default="highD/raw")
     parser.add_argument("--out_dir", type=str, default="highD") 
-    parser.add_argument("--feature_mode", type=str, choices=['baseline', 'exp1', 'exp2', 'exp3', 'exp4'], default='baseline')
+    parser.add_argument("--feature_mode", type=str, choices=EXTRA_FEATURE_MAP.keys(), default='baseline')
     parser.add_argument("--t_front", type=float, default=3.0)
     parser.add_argument("--t_back", type=float, default=5.0)
     parser.add_argument("--vy_eps", type=float, default=0.27)
@@ -48,36 +54,42 @@ def transform_coord_vec(coords, theta, center):
     return np.dot(coords_rel, rot_mat.T)
 
 def compute_extra_features_vec(rel_xy, rot_v_agent, rot_a_agent, rot_v_target, args):
+    # 💡 여기서 rel_xy는 Neighbor - Ego의 실시간 거리입니다.
     dx = rel_xy[:, 0]
     dy = rel_xy[:, 1]
+    
+    # 상대 속도 (Neighbor_v - Ego_v)
     dvx = rot_v_agent[:, 0] - rot_v_target[:, 0]
     dvy = rot_v_agent[:, 1] - rot_v_target[:, 1]
+    
+    # Neighbor의 가속도 (절대 가속도 유지)
     ax = rot_a_agent[:, 0]
     ay = rot_a_agent[:, 1]
 
+    # lc_state (Neighbor가 Ego를 기준으로 어떻게 움직이는지)
     lc_state = np.zeros_like(dy)
-    
-    # Left Lane Change (-1, -2, -3)
-    mask_l = dy < -1.0
+    mask_l = dy < -1.0 # 내 왼쪽 차선에 있을 때
     lc_state[mask_l & (dvy > args.vy_eps)] = -1.0
     lc_state[mask_l & (dvy < -args.vy_eps)] = -3.0
     lc_state[mask_l & (np.abs(dvy) <= args.vy_eps)] = -2.0
 
-    # Right Lane Change (1, 2, 3)
-    mask_r = dy > 1.0
+    mask_r = dy > 1.0 # 내 오른쪽 차선에 있을 때
     lc_state[mask_r & (dvy < -args.vy_eps)] = 1.0
     lc_state[mask_r & (dvy > args.vy_eps)] = 3.0
     lc_state[mask_r & (np.abs(dvy) <= args.vy_eps)] = 2.0
 
+    # dx_time (충돌 시간/접근 시간)
     denom = dvx.copy()
     denom[dvx >= 0] += args.eps_gate
     denom[dvx < 0] -= args.eps_gate
     dx_time = dx / denom
 
+    # gate (근접성 마스크)
     gate = np.zeros_like(dx_time)
     gate[(-args.t_back < dx_time) & (dx_time < args.t_front)] = 1.0
 
-    return np.stack([dvx, dvy, ax, ay, lc_state, dx_time, gate], axis=-1)
+    # 💡 9개 채널 구성 [dx, dy, dvx, dvy, ax, ay, lc, time, gate]
+    return np.stack([dx, dy, dvx, dvy, ax, ay, lc_state, dx_time, gate], axis=-1)
 
 # ==============================================================================
 # 2. Main Processing Logic (Pandas 병목 제거)
@@ -90,6 +102,7 @@ def process_recording(rec_id: str, raw_dir: Path, temp_dir: Path, args):
     if not (tracks_file.exists() and meta_file.exists() and rec_meta_file.exists()):
         return rec_id, {}, {}
 
+    # 1. 데이터 로드 및 전처리
     df = pd.read_csv(tracks_file)
     tmeta = pd.read_csv(meta_file)
     rmeta = pd.read_csv(rec_meta_file)
@@ -99,10 +112,11 @@ def process_recording(rec_id: str, raw_dir: Path, temp_dir: Path, args):
     
     df = df.merge(tmeta[["id", "drivingDirection"]], on="id", how="left")
     
+    # 차량 중심점 설정
     df["x"] = df["x"] + df["width"] / 2.0
     df["y"] = df["y"] + df["height"] / 2.0
     
-    # Upper Flip
+    # Upper 방향 차량 좌표 Flip (Driving Direction 1인 경우)
     upper_mask = df["drivingDirection"] == 1
     if upper_mask.any():
         up_m = [float(x) for x in str(rmeta.loc[0, "upperLaneMarkings"]).split(";") if x]
@@ -118,7 +132,7 @@ def process_recording(rec_id: str, raw_dir: Path, temp_dir: Path, args):
             df.loc[upper_mask, "yAcceleration"] *= -1
             rmeta.at[0, "upperLaneMarkings"] = ";".join(map(str, [C_y - y for y in up_m][::-1]))
     
-    # Downsampling
+    # 다운샘플링 및 정렬
     df = df[(df["frame"] % ds_stride) == 0].sort_values(["id", "frame"]).reset_index(drop=True)
 
     agents_data = {}
@@ -128,10 +142,9 @@ def process_recording(rec_id: str, raw_dir: Path, temp_dir: Path, args):
             "data": group[["x", "y", "xVelocity", "yVelocity", "xAcceleration", "yAcceleration"]].to_numpy()
         }
     
-    # 각 에이전트의 생존 프레임 캐싱 (빠른 주변 차량 필터링용)
     lifespans = {vid: (info["frames"][0], info["frames"][-1]) for vid, info in agents_data.items()}
 
-    # 차선 정보 추출
+    # 차선(Lane) 정보 생성 (Map 데이터용)
     lanes_y = []
     for col in ["upperLaneMarkings", "lowerLaneMarkings"]:
         if col in rmeta.columns and pd.notna(rmeta.loc[0, col]):
@@ -153,19 +166,16 @@ def process_recording(rec_id: str, raw_dir: Path, temp_dir: Path, args):
     out_name, out_city, out_hist, out_fut, out_lane_id = [], [], [], [], []
     out_norm, out_theta, out_pos, out_valid = [], [], [], []
 
+    # 💡 실험 설정 로드
     extra_indices = EXTRA_FEATURE_MAP[args.feature_mode]
     num_extra = len(extra_indices)
     timestamps = np.arange(-T_H + 1, 1, 1, dtype=np.float32) * (1.0 / TARGET_FPS)
-
     slide_step = int(round(args.slide_window_sec * TARGET_FPS))
 
-    # --------------------------------------------------------------------------
-    # Sliding Window 
-    # --------------------------------------------------------------------------
+    # 2. Sliding Window 루프 (Ego-Centric 데이터 생성)
     for vid, ego_info in agents_data.items():
         ego_frames = ego_info["frames"]
         ego_data = ego_info["data"]
-        
         if len(ego_frames) < SEQ_LEN: continue
             
         for start_idx in range(0, len(ego_frames) - SEQ_LEN + 1, slide_step):
@@ -174,38 +184,39 @@ def process_recording(rec_id: str, raw_dir: Path, temp_dir: Path, args):
             obs_frame = ego_frames[obs_idx]
             end_frame = ego_frames[start_idx + SEQ_LEN - 1]
             
-            # 연속된 프레임인지 확인 (결측치 방지)
-            if (end_frame - start_frame) != (SEQ_LEN - 1) * ds_stride:
-                continue
+            if (end_frame - start_frame) != (SEQ_LEN - 1) * ds_stride: continue
             
+            # 💡 [기준점 설정] norm_center: Ego의 현재 시점(t=0) 위치
             norm_center = ego_data[obs_idx, :2] 
             vx, vy = ego_data[obs_idx, 2:4]
             theta = np.arctan2(vy, vx)
             
-            # Target Agent 데이터 변환 (Vectorized)
+            # 💡 [Ego 데이터] 자기 자신의 과거/미래 궤적
             ego_hist_rel = transform_coord_vec(ego_data[start_idx : obs_idx + 1, :2], theta, norm_center)
             ego_fut_rel = transform_coord_vec(ego_data[obs_idx + 1 : start_idx + SEQ_LEN, :2], theta, norm_center)
             rot_target_vels = transform_coord_vec(ego_data[start_idx : obs_idx + 1, 2:4], theta, np.array([0, 0]))
             rot_target_accs = transform_coord_vec(ego_data[start_idx : obs_idx + 1, 4:6], theta, np.array([0, 0]))
             
+            # 텐서 초기화: [0:pos_x, 1:pos_y, 2:time, 3:mask, 4...:extra]
             hist_tensor = np.zeros((MAX_AGENTS, T_H, 4 + num_extra), dtype=np.float32) 
             fut_tensor = np.zeros((MAX_AGENTS, T_F, 3), dtype=np.float32)  
             pos_tensor = np.zeros((MAX_AGENTS, 2), dtype=np.float32)
             
-            # Index 0 (Target Agent) 채우기
-            hist_tensor[0, :, :2] = ego_hist_rel
-            hist_tensor[0, :, 2] = timestamps
-            hist_tensor[0, :, 3] = 1.0 
+            # 💡 [Index 0] Ego 정보 채우기
+            hist_tensor[0, :, 0:2] = ego_hist_rel # 자기 궤적 (x, y)
+            hist_tensor[0, :, 2]   = timestamps   # 동기화된 시간 t
+            hist_tensor[0, :, 3]   = 1.0          # 마스크 m
             if num_extra > 0:
-                full_extra = compute_extra_features_vec(ego_hist_rel, rot_target_vels, rot_target_accs, rot_target_vels, args)
-                hist_tensor[0, :, 4:] = full_extra[:, extra_indices]
+                # Ego는 자신과의 거리가 항상 0이므로 0행렬 전달
+                full_9_ego = compute_extra_features_vec(np.zeros_like(ego_hist_rel), rot_target_vels, rot_target_accs, rot_target_vels, args)
+                hist_tensor[0, :, 4:] = full_9_ego[:, extra_indices]
                 
             fut_tensor[0, :, :2] = ego_fut_rel
             fut_tensor[0, :, 2] = 1.0 
             pos_tensor[0] = ego_hist_rel[-1]
             
+            # 💡 [Index 1~8] Neighbors 정보 채우기
             agent_count = 1
-            # O(1) 수준으로 시간대가 겹치는 주변 차량만 솎아내기
             for nbr_id, nbr_info in agents_data.items():
                 if nbr_id == vid or agent_count >= MAX_AGENTS: continue
                 if lifespans[nbr_id][1] < start_frame or lifespans[nbr_id][0] > end_frame: continue
@@ -216,41 +227,47 @@ def process_recording(rec_id: str, raw_dir: Path, temp_dir: Path, args):
                 
                 match_frames = nbr_frames[valid_mask]
                 match_data = nbr_info["data"][valid_mask]
-                
-                # 프레임을 0~39 사이의 인덱스로 매핑
                 t_indices = ((match_frames - start_frame) // ds_stride).astype(int)
                 
-                # History 파트
+                # History (실시간 상대 거리 dx, dy 계산)
                 h_mask = t_indices < T_H
                 if h_mask.any():
                     idx_h = t_indices[h_mask]
                     data_h = match_data[h_mask]
-                    rel_xy = transform_coord_vec(data_h[:, :2], theta, norm_center)
-                    hist_tensor[agent_count, idx_h, :2] = rel_xy
-                    hist_tensor[agent_count, idx_h, 2] = timestamps[idx_h]
-                    hist_tensor[agent_count, idx_h, 3] = 1.0 
+                    
+                    # 1) Neighbor의 지도 원점 기준 위치
+                    nbr_rel_to_origin = transform_coord_vec(data_h[:, :2], theta, norm_center)
+                    
+                    # 2) 💡 [실시간 상대 거리] Neighbor(t) - Ego(t)
+                    instant_dx_dy = nbr_rel_to_origin - ego_hist_rel[idx_h]
+                    
+                    hist_tensor[agent_count, idx_h, 0:2] = instant_dx_dy # 상대 거리 (dx, dy)
+                    hist_tensor[agent_count, idx_h, 2]   = timestamps[idx_h]
+                    hist_tensor[agent_count, idx_h, 3]   = 1.0 
                     
                     if num_extra > 0:
                         rot_v_agent = transform_coord_vec(data_h[:, 2:4], theta, np.array([0, 0]))
                         rot_a_agent = transform_coord_vec(data_h[:, 4:6], theta, np.array([0, 0]))
-                        full_extra = compute_extra_features_vec(rel_xy, rot_v_agent, rot_a_agent, rot_target_vels[idx_h], args)
-                        hist_tensor[agent_count, idx_h, 4:] = full_extra[:, extra_indices]
+                        # 실시간 거리를 기반으로 extra feature(lc_state, dx_time 등) 계산
+                        full_9_nbr = compute_extra_features_vec(instant_dx_dy, rot_v_agent, rot_a_agent, rot_target_vels[idx_h], args)
+                        hist_tensor[agent_count, idx_h, 4:] = full_9_nbr[:, extra_indices]
                         
                     if T_H - 1 in idx_h:
-                        pos_tensor[agent_count] = rel_xy[np.where(idx_h == T_H - 1)[0][0]]
+                        pos_tensor[agent_count] = instant_dx_dy[np.where(idx_h == T_H - 1)[0][0]]
                 
-                # Future 파트
+                # Future (단순 위치 저장)
                 f_mask = t_indices >= T_H
                 if f_mask.any():
                     idx_f = t_indices[f_mask] - T_H
                     data_f = match_data[f_mask]
-                    rel_xy = transform_coord_vec(data_f[:, :2], theta, norm_center)
-                    fut_tensor[agent_count, idx_f, :2] = rel_xy
+                    nbr_fut_rel = transform_coord_vec(data_f[:, :2], theta, norm_center)
+                    # Future는 모델이 정답으로 쓰는 것이므로 Ego와의 상대 거리보다는 지도상의 좌표를 유지합니다.
+                    fut_tensor[agent_count, idx_f, :2] = nbr_fut_rel
                     fut_tensor[agent_count, idx_f, 2] = 1.0 
                 
-                if h_mask.any() or f_mask.any():
-                    agent_count += 1
+                if h_mask.any() or f_mask.any(): agent_count += 1
             
+            # 최종 리스트 저장
             lane_ids = list(lane_id2idx.values())[:MAX_LANES]
             valid_lane_num = len(lane_ids)
             padded_lane_ids = lane_ids + [-1] * (MAX_LANES - valid_lane_num)
@@ -265,13 +282,13 @@ def process_recording(rec_id: str, raw_dir: Path, temp_dir: Path, args):
             out_pos.append(pos_tensor)
             out_valid.append([agent_count, valid_lane_num])
 
+    # 3. 임시 파일 저장 (병렬 처리 효율성)
     if out_hist:
         temp_file = temp_dir / f"{rec_id}.h5"
         dt_str = h5py.string_dtype(encoding='utf-8')
         with h5py.File(temp_file, 'w') as f:
             f.create_dataset('NAME', data=np.array(out_name, dtype=object), dtype=dt_str)
             f.create_dataset('CITY_NAME', data=np.array(out_city, dtype=object), dtype=dt_str)
-            
             f.create_dataset('HISTORY', data=np.array(out_hist, dtype=np.float32), compression="gzip")
             f.create_dataset('FUTURE', data=np.array(out_fut, dtype=np.float32), compression="gzip")
             f.create_dataset('LANE_ID', data=np.array(out_lane_id, dtype=np.int32), compression="gzip")

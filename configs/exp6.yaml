@@ -1,0 +1,68 @@
+# =========================================================
+# EXPERIMENT SETTING
+# =========================================================
+exp:
+  feature_mode: 'exp6'       # EXTRA_FEATURE_MAP의 'exp6' ([6, 7]) 사용
+  seed: 42
+  device: 'cuda'
+
+# =========================================================
+# DATA CONFIGURATION
+# =========================================================
+data:
+  base_dir: 'highD'          # train.py에서 feature_mode와 결합되어 경로 생성
+  batch_size: 1024
+  num_workers: 32
+  persistent_workers: true
+
+# =========================================================
+# MODEL PARAMETERS
+# =========================================================
+model:
+  type: 'stacked_transformer'
+              
+  lane_channels: 7
+  lane_length: 10           
+  
+  # 텐서 구조 정의
+  max_lane_num: 6            # MAX_LANES
+  max_agent_num: 9           # MAX_AGENTS
+  history_num_frames: 15
+  future_num_frames: 25
+  
+  # 다중 경로(Multi-modal) 예측
+  K: 6                       
+  queries: 6
+  num_guesses: 6
+
+  queries_dim: 64
+  enc_dim: 64
+  aux_task: false
+  increasetime: 3
+
+  subgraph_width: 32
+  num_subgraph_layres: 2
+
+# =========================================================
+# TRAINING STRATEGY
+# =========================================================
+train:
+  device: cuda
+  seed: 42
+
+  epochs: 500
+  lr: 0.0003
+  weight_decay: 0.0001
+
+  persistent_workers: true
+  use_amp: true
+  
+  w_reg: 2     
+  w_cls: 1 
+
+  # Checkpoint & Logging
+  ckpt_dir: ckpts   
+  
+  # Scheduler
+  lr_schedule: cosine
+  warmup_steps: 500
