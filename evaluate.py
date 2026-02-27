@@ -10,10 +10,24 @@ from tqdm import tqdm
 import argparse
 from torch.amp import autocast
 import time
+from pathlib import Path
 
-from lib.utils.utilities import load_config_data, load_model_class
+from lib.utils.utilities import load_config_data
 from lib.models.mmTransformer import mmTrans
 from lib.models.TF_version.stacked_transformer import STF
+
+EXTRA_FEATURE_MAP = {
+    'baseline': [0, 1],              
+    'exp1': [0, 1, 6, 7],                  
+    'exp2': [0, 1, 4, 5, 6, 7, 8],               
+    'exp3': [0, 1, 2, 3, 4, 5, 8],               
+    'exp4': [0, 1, 2, 3, 4, 5, 6, 7, 8],   
+    'exp5': [0, 1, 6, 7, 8],
+    'exp6': [6, 7],
+    'exp7': [4, 5, 6, 7, 8],
+    'exp8': [0, 1, 6, 8],
+    'exp9': [0, 1, 8]            
+}
 
 # ==============================================================================
 # 1. Dataset (train.py와 동일 구조)
@@ -21,36 +35,37 @@ from lib.models.TF_version.stacked_transformer import STF
 class HighDDataset(Dataset):
     def __init__(self, data_path, map_path):
         self.h5_path = data_path
-
+        
         with open(map_path, 'rb') as f:
             map_info = pickle.load(f)
             self.map_data = map_info['Map']
-
+        
         print(f"[{data_path}] RAM에 데이터를 올리는 중...")
         with h5py.File(self.h5_path, 'r') as f:
             self.length = len(f['HISTORY'])
-
-            self.hist       = torch.from_numpy(f['HISTORY'][:]).float()
-            self.fut        = torch.from_numpy(f['FUTURE'][:]).float()
-            self.pos        = torch.from_numpy(f['POS'][:]).float()
-            self.valid_len  = torch.from_numpy(f['VALID_LEN'][:]).long()
-            self.norm_center= torch.from_numpy(f['NORM_CENTER'][:]).float()
-            self.theta      = torch.from_numpy(f['THETA'][:]).float()
-
-            lane_ids       = f['LANE_ID'][:]
+            
+            self.hist = torch.from_numpy(f['HISTORY'][:]).float()
+            self.fut = torch.from_numpy(f['FUTURE'][:]).float()
+            self.pos = torch.from_numpy(f['POS'][:]).float()
+            self.valid_len = torch.from_numpy(f['VALID_LEN'][:]).long()
+            self.norm_center = torch.from_numpy(f['NORM_CENTER'][:]).float()
+            self.theta = torch.from_numpy(f['THETA'][:]).float()
+            
+            lane_ids = f['LANE_ID'][:]
             city_names_raw = f['CITY_NAME'][:]
-            city_names     = [c.decode('utf-8') if isinstance(c, bytes) else str(c) for c in city_names_raw]
-
+            city_names = [c.decode('utf-8') if isinstance(c, bytes) else str(c) for c in city_names_raw]
+            
         print(f"[{data_path}] 차선(Lane) 피처 사전 병합 중...")
         max_lanes = lane_ids.shape[1]
         lane_tensor_np = np.zeros((self.length, max_lanes, 10, 5), dtype=np.float32)
-
+        
+        # tqdm으로 진행률 표시
         for i in tqdm(range(self.length), desc="Assembling Lanes"):
             city_map = self.map_data[city_names[i]]
             for j, l_id in enumerate(lane_ids[i]):
                 if l_id != -1:
                     lane_tensor_np[i, j] = city_map[l_id]
-
+                    
         self.lanes = torch.from_numpy(lane_tensor_np).float()
         print(f"[{data_path}] 모든 데이터 PyTorch Tensor 적재 완료!\n")
 
@@ -59,15 +74,14 @@ class HighDDataset(Dataset):
 
     def __getitem__(self, idx):
         return {
-            'HISTORY'    : self.hist[idx],
-            'FUTURE'     : self.fut[idx],
-            'POS'        : self.pos[idx],
-            'LANE'       : self.lanes[idx],
-            'VALID_LEN'  : self.valid_len[idx],
+            'HISTORY': self.hist[idx],
+            'FUTURE': self.fut[idx],
+            'POS': self.pos[idx],
+            'LANE': self.lanes[idx],
+            'VALID_LEN': self.valid_len[idx],
             'NORM_CENTER': self.norm_center[idx],
-            'THETA'      : self.theta[idx],
+            'THETA': self.theta[idx]
         }
-
 
 # ==============================================================================
 # 2. Metric 계산 함수들
@@ -226,127 +240,101 @@ def measure_inference_time(model, dataset, device, num_iters=10000):
 # ==============================================================================
 def evaluate(args):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    if device.type == 'cuda':
-        torch.backends.cudnn.benchmark = True
-
     cfg = load_config_data(args.config)
 
-    # ── 모델 설정 병합 (train.py와 동일) ──────────────────────────────────────
-    model_cfg = {}
-    for key in ['data', 'model', 'train']:
-        if key in cfg and isinstance(cfg[key], dict):
-            model_cfg.update(cfg[key])
-    for k, v in cfg.items():
-        if not isinstance(v, dict):
-            model_cfg[k] = v
+    # ✅ 실험 모드 및 채널 자동 설정 (train.py와 동기화)
+    feature_mode = cfg.get('exp', {}).get('feature_mode', 'baseline')
+    num_extra = len(EXTRA_FEATURE_MAP[feature_mode])
+    in_channels = 4 + num_extra
+    
+    model_cfg = cfg.get('model', {})
+    model_cfg['in_channels'] = in_channels
+    model_cfg['max_lane_num'], model_cfg['max_agent_num'] = 6, 9
+    model_cfg['lane_channels'] = 7
+    model_cfg['out_channels'] = model_cfg.get('future_num_frames', 25) * 2
 
-    model_cfg['max_lane_num']   = 6
-    model_cfg['max_agent_num']  = 9
-    model_cfg['lane_channels']  = 7
+    model = mmTrans(STF, model_cfg).to(device)
 
-    # ── 모델 초기화 ───────────────────────────────────────────────────────────
-    stacked_transformer_class = STF
-    model = mmTrans(stacked_transformer_class, model_cfg).to(device)
-    model.max_lane_num  = 6
-    model.max_agent_num = 9
-
-    # ── 체크포인트 경로 결정 ──────────────────────────────────────────────────
-    if args.checkpoint:
-        ckpt_path = args.checkpoint
+    # ✅ 체크포인트 경로 자동 탐색
+    if args.ckpt:
+        ckpt_path = args.ckpt
     else:
-        config_name = os.path.basename(args.config).replace('.yaml', '')
-        ckpt_dir    = cfg.get('train', {}).get('ckpt_dir', './ckpts')
-        ckpt_path   = os.path.join(ckpt_dir, config_name, 'best.pt')
+        ckpt_dir = Path(cfg.get('train', {}).get('ckpt_dir', './ckpts'))
+        ckpt_path = ckpt_dir / feature_mode / "best.pt"
 
-    if not os.path.isfile(ckpt_path):
-        raise FileNotFoundError(f"체크포인트를 찾을 수 없습니다: {ckpt_path}")
-
-    model = load_checkpoint(ckpt_path, model, device)
+    print(f"📂 평가 모델: {ckpt_path} (Mode: {feature_mode})")
+    checkpoint = torch.load(ckpt_path, map_location=device)
+    model.load_state_dict(checkpoint.get('model_state_dict', checkpoint.get('state_dict', checkpoint)))
     model.eval()
 
-    # ── 데이터셋 로드 ─────────────────────────────────────────────────────────
-    split      = args.split  # 'test' or 'val'
-    data_file  = os.path.join(args.data_dir, f'{split}.h5')
-    map_file   = os.path.join(args.data_dir, 'map.pkl')
-    dataset    = HighDDataset(data_path=data_file, map_path=map_file)
-
-    batch_size  = cfg.get('data', {}).get('batch_size', 512)
-    num_workers = min(32, os.cpu_count() or 4)
-
-    loader = DataLoader(
-        dataset, batch_size=batch_size, shuffle=False,
-        num_workers=num_workers, pin_memory=True,
-        prefetch_factor=4, persistent_workers=True,
-    )
+    # ✅ 데이터 경로 자동 설정
+    data_dir = Path(args.data_dir) / feature_mode
+    dataset = HighDDataset(str(data_dir / f"{args.split}.h5"), str(data_dir / "map.pkl"))
+    loader = DataLoader(dataset, batch_size=cfg.get('data', {}).get('batch_size', 512), 
+                        shuffle=False, num_workers=8, pin_memory=True)
 
     # --- Mode 1: Inference Time Measurement ---
     if args.measure_time:
         measure_inference_time(model, dataset, device, num_iters=10000)
         return
 
-    # ── 평가 루프 ─────────────────────────────────────────────────────────────
-    metric_keys = ['minADE', 'minFDE', 'RMSE',
-                   'RMSE@1s', 'RMSE@2s', 'RMSE@3s', 'RMSE@4s', 'RMSE@5s']
+    metric_keys = ['minADE', 'minFDE', 'RMSE'] + [f'RMSE@{s}s' for s in range(1, 6)]
     accum = {k: 0.0 for k in metric_keys}
     total_samples = 0
 
-    print(f"\n🚀 평가 시작 — split: [{split}] | device: {device}\n")
-
     with torch.no_grad():
-        pbar = tqdm(loader, desc=f"Evaluating [{split}]")
+        pbar = tqdm(loader, desc=f"Eval [{args.split}]")
         for batch_data in pbar:
             for k, v in batch_data.items():
-                if isinstance(v, torch.Tensor):
-                    batch_data[k] = v.to(device, non_blocking=True)
+                if isinstance(v, torch.Tensor): batch_data[k] = v.to(device)
 
-            with autocast(device_type='cuda' if device.type == 'cuda' else 'cpu'):
-                pred, conf = model(batch_data)
-
-            # Target agent 추출 (train.py와 동일한 로직)
-            target_pred = pred[:, 0, ...] if pred.dim() == 5 else pred   # [B, K, T, 2]
-            target_gt   = batch_data['FUTURE'][:, 0, :, :2]              # [B, T, 2]
-
-            B = target_gt.size(0)
+            with autocast(device_type='cuda'):
+                pred, _ = model(batch_data)
+            
+            target_pred = pred[:, 0, ...] if pred.dim() == 5 else pred
+            target_gt = batch_data['FUTURE'][:, 0, :, :2]
+            
             metrics = compute_metrics_detailed(target_pred, target_gt)
+            for k in metric_keys: accum[k] += metrics[k].sum().item()
+            total_samples += target_gt.size(0)
 
-            for k in metric_keys:
-                accum[k] += metrics[k].sum().item()
-            total_samples += B
-
-            # tqdm 실시간 표시 (배치 평균)
-            pbar.set_postfix({
-                'minADE': f"{metrics['minADE'].mean().item():.3f}",
-                'minFDE': f"{metrics['minFDE'].mean().item():.3f}",
-                'RMSE'  : f"{metrics['RMSE'].mean().item():.3f}",
-            })
-
-    # ── 최종 평균 집계 ────────────────────────────────────────────────────────
     final = {k: accum[k] / total_samples for k in metric_keys}
+    
+    header = f" 🏁 Final Evaluation Result: [{feature_mode}] "
+    print("\n" + " " * 10 + "●" * 40)
+    print(f"{header:^60}")
+    print(" " * 10 + "●" * 40 + "\n")
 
-    # ── 콘솔 출력 ─────────────────────────────────────────────────────────────
-    sep = "=" * 52
-    print(f"\n{sep}")
-    print(f"  평가 결과 | split: {split} | samples: {total_samples:,}")
-    print(sep)
-    print(f"  {'minADE':<14}: {final['minADE']:.4f} m")
-    print(f"  {'minFDE':<14}: {final['minFDE']:.4f} m")
-    print(f"  {'RMSE':<14}: {final['RMSE']:.4f} m")
-    print(f"  {'-'*44}")
-    for s in range(1, 6):
-        key = f'RMSE@{s}s'
-        print(f"  {key:<14}: {final[key]:.4f} m")
-    print(f"{sep}\n")
+    # 1. 핵심 지표 (Overall Metrics)
+    print(f"  📂 Target Split  : {args.split}")
+    print(f"  🔢 Total Samples : {total_samples:,}")
+    print(f"  📍 Checkpoint    : {Path(ckpt_path).name}")
+    print("-" * 50)
+    
+    print(f"  🔥 minADE        : {final['minADE']:.4f} m")
+    print(f"  🔥 minFDE        : {final['minFDE']:.4f} m")
+    print(f"  🔥 RMSE (Total)  : {final['RMSE']:.4f} m")
+    
+    print("-" * 50)
+    
+    # 2. 시간대별 상세 지표 (Time-step Metrics)
+    # 논문에 들어갈 RMSE@Ns 수치를 테이블 형태로 출력합니다.
+    print(f"  🕒 Time-step Analysis (RMSE)")
+    print(f"  {'-' * 32}")
+    print(f"  |  1.0s  |  2.0s  |  3.0s  |  4.0s  |  5.0s  |")
+    print(f"  | {final['RMSE@1s']:^6.3f} | {final['RMSE@2s']:^6.3f} | {final['RMSE@3s']:^6.3f} | {final['RMSE@4s']:^6.3f} | {final['RMSE@5s']:^6.3f} |")
+    print(f"  {'-' * 32}")
 
-    # ── CSV 저장 ──────────────────────────────────────────────────────────────
+    print("\n" + "=" * 50 + "\n")
+
     if args.save_csv:
         os.makedirs(args.output_dir, exist_ok=True)
-        ckpt_tag  = os.path.splitext(os.path.basename(ckpt_path))[0]
-        csv_name  = f"eval_{split}_{ckpt_tag}.csv"
-        csv_path  = os.path.join(args.output_dir, csv_name)
-
-        csv_row = {'split': split, 'checkpoint': ckpt_path,
-                   'num_samples': total_samples, **final}
-        save_csv(csv_row, csv_path)
+        csv_path = os.path.join(args.output_dir, f"eval_{feature_mode}_{args.split}.csv")
+        with open(csv_path, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=['mode'] + metric_keys)
+            writer.writeheader()
+            writer.writerow({'mode': feature_mode, **final})
+        print(f"📄 CSV Saved: {csv_path}")
 
     return final
 
@@ -355,32 +343,13 @@ def evaluate(args):
 # 6. Entry Point
 # ==============================================================================
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="mmTransformer Evaluation on highD")
-
-    parser.add_argument('--config',
-                        type=str, default='configs/baseline.yaml',
-                        help='학습에 사용한 config 파일 경로')
-    parser.add_argument('--data_dir',
-                        type=str, default='highD/baseline',
-                        help='h5 및 map.pkl이 위치한 데이터 폴더')
-    parser.add_argument('--split',
-                        type=str, default='test', choices=['val', 'test'],
-                        help='평가할 데이터 split (val 또는 test)')
-
-    # 체크포인트: 미지정 시 save_dir/config_name/best.pt 자동 탐색
-    parser.add_argument('--checkpoint',
-                        type=str, default="ckpts/baseline/best.pt",
-                        help='체크포인트 경로 (.pt). 미지정 시 best.pt 자동 로드')
-
-    parser.add_argument('--measure_time', action='store_true', 
-                        help='Inference time을 측정 모드 (Batch size 1, 10000 iters)')
-    # 결과 저장
-    parser.add_argument('--save_csv',
-                        action='store_true', default=True,
-                        help='결과를 CSV로 저장 (기본값: True)')
-    parser.add_argument('--output_dir',
-                        type=str, default='./results',
-                        help='CSV 저장 디렉토리')
-
-    args = parser.parse_args()
-    evaluate(args)
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--config', type=str, default='configs/baseline.yaml')
+    parser.add_argument('--data_dir', type=str, default='highD')
+    parser.add_argument('--split', type=str, default='test', choices=['val', 'test'])
+    parser.add_argument('--ckpt', type=str, default=None)
+    parser.add_argument('--measure_time', action='store_true')
+    parser.add_argument('--save_csv', action='store_true', default=True)
+    parser.add_argument('--output_dir', type=str, default='./results')
+    
+    evaluate(args := parser.parse_args())
