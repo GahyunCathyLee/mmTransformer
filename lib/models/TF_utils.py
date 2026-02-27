@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-from torch.autograd import Variable
 from copy import deepcopy
 import math
 
@@ -265,8 +264,7 @@ class PositionalEncoding(nn.Module):
         self.register_buffer('pe', pe)
 
     def forward(self, x):
-        # x = x + Variable(self.pe[:, :x.size(1)], requires_grad=False)
-        x = x + Variable(self.pe[:x.shape[-2]], requires_grad=False)
+        x = x + self.pe[:x.shape[-2]]
         return self.dropout(x)
 
 

@@ -118,7 +118,7 @@ def compute_loss(pred_trajs, pred_confs, gt_trajs):
         loss_cls = F.cross_entropy(pred_confs, best_k_idx)
 
     total_loss = loss_reg + loss_cls
-    return total_loss, loss_reg, loss_cls
+    return total_loss, loss_reg, loss_cls, best_k_idx
 
 def compute_metrics(pred_traj, gt_traj):
     """
@@ -158,6 +158,7 @@ def print_model_size(model):
 
 def train(args):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    cudnn.benchmark = True
     cfg = load_config_data(args.config)
     
     # ✅ 2. 실험 모드 및 채널 수 자동 계산
@@ -194,8 +195,8 @@ def train(args):
     future_frames = model_cfg.get('future_num_frames', 25)
     model_cfg['out_channels'] = future_frames * 2
     
-    model = mmTrans(STF, model_cfg).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=float(cfg.get('train', {}).get('lr', 1e-4)))
+    raw_model = mmTrans(STF, model_cfg).to(device)
+    optimizer = torch.optim.Adam(raw_model.parameters(), lr=float(cfg.get('train', {}).get('lr', 1e-4)))
     
     use_amp = cfg.get('train', {}).get('use_amp', True)
     scaler = GradScaler('cuda') if use_amp else None
@@ -240,7 +241,7 @@ def train(args):
             
             # 가중치 복구 (다양한 키값 대응)
             state_key = 'model_state_dict' if 'model_state_dict' in checkpoint else 'state_dict'
-            model.load_state_dict(checkpoint[state_key])
+            raw_model.load_state_dict(checkpoint[state_key])
             
             if 'optimizer_state_dict' in checkpoint:
                 optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
@@ -251,7 +252,7 @@ def train(args):
         else:
             print(f"⚠️ [Resume] 체크포인트를 찾을 수 없어 처음부터 학습을 시작합니다.")
 
-    print(f"Start Training on {device} with AMP Enabled...\n")
+    model = torch.compile(raw_model)
     
     for epoch in range(start_epoch, num_epochs + 1):
         print(f"{'=' * 30}  Epoch {epoch}/{num_epochs}  {'=' * 30}")
@@ -271,14 +272,10 @@ def train(args):
 
             with context:
                 pred, conf = model(batch_data)
-                
-                # Target Agent 추출
                 target_pred = pred[:, 0, ...] if pred.dim() == 5 else pred
                 target_conf = conf[:, 0, ...] if conf.dim() == 3 else conf
                 target_gt = batch_data['FUTURE'][:, 0, :, :2]
-
-                # Best-of-K 선택을 위한 Loss 및 Index 계산
-                loss, l_reg, l_cls = compute_loss(target_pred, target_conf, target_gt)
+                loss, l_reg, l_cls, best_k_idx = compute_loss(target_pred, target_conf, target_gt)
 
                 if torch.isnan(loss):
                     print("⚠️ NaN Loss detected! Skipping this batch...")
@@ -303,13 +300,14 @@ def train(args):
             writer.add_scalar('Train/Batch_Loss', loss.item(), curr_step)
             writer.add_scalar('Train/Learning_Rate', optimizer.param_groups[0]['lr'], curr_step)
 
+
+
             # Metric 계산 (Best-of-K 기반)
             with torch.no_grad():
-                dist_last = torch.norm(target_pred[:, :, -1, :] - target_gt[:, -1, :].unsqueeze(1), dim=-1)
-                best_idx = torch.argmin(dist_last, dim=-1)
-                best_traj = target_pred[torch.arange(target_pred.size(0)), best_idx]
+                best_traj = target_pred[torch.arange(target_pred.size(0)), best_k_idx]
                 
                 ade, rmse = compute_metrics(best_traj, target_gt)
+
                 train_loss += loss.item()
                 train_ade += ade
                 train_rmse += rmse
@@ -332,12 +330,10 @@ def train(args):
                     target_conf = conf[:, 0, ...] if conf.dim() == 3 else conf
                     target_gt = batch_data['FUTURE'][:, 0, :, :2]
 
-                    loss, _, _ = compute_loss(target_pred, target_conf, target_gt)
+                    loss, _, _, best_k_idx_v = compute_loss(target_pred, target_conf, target_gt)
                 
                 # Best 궤적 선택 후 Metric 계산
-                dist_last_v = torch.norm(target_pred[:, :, -1, :] - target_gt[:, -1, :].unsqueeze(1), dim=-1)
-                best_idx_v = torch.argmin(dist_last_v, dim=-1)
-                best_traj_v = target_pred[torch.arange(target_pred.size(0)), best_idx_v]
+                best_traj_v = target_pred[torch.arange(target_pred.size(0)), best_k_idx_v]
                 
                 v_ade, v_rmse = compute_metrics(best_traj_v, target_gt)
                 
@@ -361,7 +357,7 @@ def train(args):
             best_rmse = avg_v_rmse
             torch.save({
                 'epoch': epoch,
-                'model_state_dict': model.state_dict(),
+                'model_state_dict': raw_model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'val_rmse': best_rmse,
                 'feature_mode': feature_mode

@@ -2,7 +2,7 @@
 # EXPERIMENT SETTING
 # =========================================================
 exp:
-  feature_mode: 'exp6'       # EXTRA_FEATURE_MAP의 'exp6' ([6, 7]) 사용
+  feature_mode: 'exp8'       # EXTRA_FEATURE_MAP의 'exp6' ([6, 7]) 사용
   seed: 42
   device: 'cuda'
 
@@ -55,7 +55,7 @@ train:
   weight_decay: 0.0001
 
   persistent_workers: true
-  use_amp: true
+  use_amp: false
   
   w_reg: 2     
   w_cls: 1 

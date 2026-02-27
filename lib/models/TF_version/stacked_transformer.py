@@ -94,7 +94,6 @@ class STF(nn.Module):
                 nn.init.xavier_uniform_(param)
 
         self.query_embed = nn.Embedding(self.num_queries, d_model)
-        self.query_embed.weight.requires_grad == False
         nn.init.orthogonal_(self.query_embed.weight)
 
     # input: [inp, dec_inp, src_att, trg_att]
@@ -113,21 +112,20 @@ class STF(nn.Module):
                 outputs_coord: [batch size, max_agent_num, num_query, 30, 2]
                 outputs_class: [batch size, max_agent_num, num_query]
         '''
+        B, A = traj.shape[:2]
 
-        self.query_batches = self.query_embed.weight.view(
-            1, 1, *self.query_embed.weight.shape).repeat(*traj.shape[:2], 1, 1)
+        self.query_batches = self.query_embed.weight.view(1, 1, self.num_queries, -1).expand(B, A, -1, -1)
 
         # Trajectory transfomer
         hist_out = self.hist_tf(traj, self.query_batches, None, None)
         pos = self.pos_emb(pos)
-        hist_out = torch.cat([pos.unsqueeze(dim=2).repeat(
-            1, 1, self.num_queries, 1), hist_out], dim=-1)
+        hist_out = torch.cat([pos.unsqueeze(dim=2).expand(-1, -1, self.num_queries, -1), hist_out], dim=-1)
         hist_out = self.fusion1(hist_out)
         
         # Lane encoder
         lane_mem = self.lane_enc(self.lane_emb(lane_enc), lane_mask)
-        lane_mem = lane_mem.unsqueeze(1).repeat(1, social_num, 1, 1)
-        lane_mask = lane_mask.unsqueeze(1).repeat(1, social_num, 1, 1)
+        lane_mem = lane_mem.unsqueeze(1).expand(B, social_num, -1, -1)  # repeat → expand
+        lane_mask = lane_mask.unsqueeze(1).expand(B, int(social_num), -1, -1)
         
         # Lane decoder
         lane_out = self.lane_dec(hist_out, lane_mem, lane_mask, None)
@@ -139,8 +137,7 @@ class STF(nn.Module):
         # Social layer
         social_inp = self.fusion2(torch.cat([pos, dist], -1))
         social_mem = self.social_enc(social_inp, social_mask)
-        social_out = social_mem.unsqueeze(
-            dim=2).repeat(1, 1, self.num_queries, 1)
+        social_out = social_mem.unsqueeze(dim=2).expand(-1, -1, self.num_queries, -1)
         out = torch.cat([social_out, lane_out], -1)
 
         # Prediction head

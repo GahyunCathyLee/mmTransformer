@@ -81,11 +81,9 @@ class mmTrans(nn.Module):
         '''
         # social mask
         social_valid_len = self.traj_valid_len
-        social_mask = torch.zeros(
-            (self.B, 1, int(self.max_agent_num))).to(traj.device)
-        for i in range(self.B):
-            social_mask[i, 0, :social_valid_len[i]] = 1
-
+        idx = torch.arange(self.max_agent_num, device=traj.device).unsqueeze(0)  # [1, max_agent]
+        social_mask = (idx < social_valid_len.unsqueeze(1)).unsqueeze(1).float()  # [B, 1, max_agent]
+        
         return social_mask
 
     def preprocess_lane(self, lane):
@@ -100,23 +98,14 @@ class mmTrans(nn.Module):
             lane_mask: [batch size, 1, max_lane_num]
 
         '''
-
-        # transform lane to vector
         lane_v = torch.cat(
-            [lane[:, :, :-1, :2],
-             lane[:, :, 1:, :2],
-             lane[:, :, 1:, 2:]], dim=-1)  # bxnlinex9x7
+            [lane[:, :, :-1, :2], lane[:, :, 1:, :2], lane[:, :, 1:, 2:]], dim=-1)
 
-        # lane mask
-        lane_valid_len = self.lane_valid_len
-        lane_mask = torch.zeros(
-            (self.B, 1, int(self.max_lane_num))).to(lane_v.device)
-        for i in range(lane_valid_len.shape[0]):
-            lane_mask[i, 0, :lane_valid_len[i]] = 1
+        idx = torch.arange(int(self.max_lane_num), device=lane_v.device).unsqueeze(0)
+        lane_mask = (idx < self.lane_valid_len.unsqueeze(1)).unsqueeze(1).float()
 
-        # use vector like structure process lane
-        lane_feature = self.subgraph(lane_v)  # [batch size, max_lane_num, 64]
-
+        lane_feature = self.subgraph(lane_v)
+        
         return lane_feature, lane_mask
 
     def forward(self, data: dict):
