@@ -95,24 +95,24 @@ class HighDDataset(Dataset):
 def compute_loss(pred_trajs, pred_confs, gt_trajs):
     """
     pred_trajs: [B, K, T, 2]
-    pred_confs: [B, K] 
+    pred_confs: [B, K] - 모델의 Raw Logits (Softmax 적용 전) 권장
     gt_trajs: [B, T, 2]
     """
     B, K, T, _ = pred_trajs.shape
 
-    # 1. Best-of-K (마지막 프레임 FDE 기준)
+    # 1. Best-of-K (FDE 기준 가장 가까운 궤적 선택)
     pred_endpoints = pred_trajs[:, :, -1, :]  # [B, K, 2]
     gt_endpoints = gt_trajs[:, -1, :].unsqueeze(1)  # [B, 1, 2]
     
     distances = torch.norm(pred_endpoints - gt_endpoints, dim=-1)  
     best_k_idx = torch.argmin(distances, dim=-1)  
 
-    # 2. Regression Loss (Smooth L1)
+    # 2. Regression Loss: Smooth L1 (Huber Loss와 유사)
     best_pred_trajs = pred_trajs[torch.arange(B), best_k_idx]  
     loss_reg = F.smooth_l1_loss(best_pred_trajs, gt_trajs)
 
-    # 3. Classification Loss (NLL Loss)
-    loss_cls = F.nll_loss(pred_confs, best_k_idx)
+    # 3. Classification Loss: Cross Entropy 사용
+    loss_cls = F.cross_entropy(pred_confs, best_k_idx)
 
     total_loss = loss_reg + loss_cls
     return total_loss, loss_reg, loss_cls
