@@ -289,8 +289,7 @@ def evaluate(args):
             for k, v in batch_data.items():
                 if isinstance(v, torch.Tensor): batch_data[k] = v.to(device)
 
-            with autocast(device_type='cuda'):
-                pred, _ = model(batch_data)
+            pred, _ = model(batch_data)
             
             target_pred = pred[:, 0, ...] if pred.dim() == 5 else pred
             target_gt = batch_data['FUTURE'][:, 0, :, :2]
