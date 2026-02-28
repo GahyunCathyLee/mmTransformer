@@ -275,6 +275,7 @@ def evaluate(args):
 
     # --- Mode 1: Inference Time Measurement ---
     if args.measure_time:
+        model = torch.compile(model)
         measure_inference_time(model, dataset, device, num_iters=10000)
         return
 
