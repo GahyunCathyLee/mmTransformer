@@ -322,7 +322,7 @@ def evaluate(args):
     print(f"  🕒 Time-step Analysis (RMSE)")
     print(f"  {'-' * 32}")
     print(f"  |  1.0s  |  2.0s  |  3.0s  |  4.0s  |  5.0s  |")
-    print(f"  | {final['RMSE@1s']:^6.3f} | {final['RMSE@2s']:^6.3f} | {final['RMSE@3s']:^6.3f} | {final['RMSE@4s']:^6.3f} | {final['RMSE@5s']:^6.3f} |")
+    print(f"  | {final['RMSE@1s']:^6.4f} | {final['RMSE@2s']:^6.4f} | {final['RMSE@3s']:^6.4f} | {final['RMSE@4s']:^6.4f} | {final['RMSE@5s']:^6.4f} |")
     print(f"  {'-' * 32}")
 
     print("\n" + "=" * 50 + "\n")
