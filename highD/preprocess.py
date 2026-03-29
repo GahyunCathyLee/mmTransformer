@@ -15,9 +15,9 @@ from typing import Dict, List, Optional, Tuple
 # ==============================================================================
 # 1. Configuration & Constants
 # ==============================================================================
-TARGET_FPS = 5.0
-T_H = 15
-T_F = 25
+TARGET_FPS = 3.0
+T_H = 6
+T_F = 15
 SEQ_LEN = T_H + T_F
 MAX_AGENTS = 9
 MAX_LANES  = 6
@@ -50,17 +50,9 @@ SLOT_WEIGHTS = [0.4944, 0.0411, 0.0935, 0.0074, 0.0002, 0.5559, 0.0000, 0.1179]
 # ------------------------------------------------------------------
 # fmt: off
 EXTRA_FEATURE_MAP = {
-    'baseline': [0, 1],
-    'exp1':     [0, 1, 6, 7],
-    'exp2':     [0, 1, 4, 5, 6, 7, 9],
-    'exp3':     [0, 1, 2, 3, 4, 5, 9],
-    'exp4':     [0, 1, 2, 3, 4, 5, 6, 7, 9],
-    'exp5':     [0, 1, 6, 7, 9],
-    'exp6':     [6, 7],
-    'exp7':     [4, 5, 6, 7, 9],
-    'exp8':     [0, 1, 6, 9],
-    'exp9':     [0, 1, 9],
-    'full':     [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+    'baseline': [0, 1, 2, 3, 4, 5],
+    'importance': [0, 1, 2, 3, 4, 5, 12],
+    'Iy': [0, 1, 2, 3, 4, 5, 11],
 }
 # fmt: on
 
@@ -193,11 +185,11 @@ def parse_args():
                         help="Top-N gate: keep up to N slots with highest I. 0=disabled")
     parser.add_argument("--gate_mask",  action="store_true", default=False,
                         help="If set, gate=0 neighbors are zeroed in hist_tensor and excluded from valid count")
-    parser.add_argument("--slot_importance_alpha", type=float, default=0.0, dest="slot_importance_alpha",
+    parser.add_argument("--slot_importance", type=float, default=0.0, dest="slot_importance_alpha",
                         help="Slot importance boost: I_new = min(I*(1+alpha*w_slot), 1.0). 0.0=disabled")
 
     # lc_state version
-    parser.add_argument("--lc_version", default="v3", choices=["v1", "v2", "v3", "v4"],
+    parser.add_argument("--lc_version", default="v4", choices=["v1", "v2", "v3", "v4"],
                         help="lc_state 계산 방식: "
                              "v1=slot기반 절대yV | v2=dvy기반+slot/dy조합 | "
                              "v3=latV+lco기반 (default) | v4=lco_norm기반")
