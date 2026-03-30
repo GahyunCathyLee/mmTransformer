@@ -25,8 +25,8 @@ from lib.utils.utilities import load_config_data
 from lib.models.mmTransformer import mmTrans
 from lib.models.TF_version.stacked_transformer import STF
 
-# train_mmT.py 의 공통 객체 재사용
-from train_mmT import (
+# train.py 의 공통 객체 재사용
+from train import (
     EXTRA_FEATURE_MAP,
     HighDDataset,
     build_model,
