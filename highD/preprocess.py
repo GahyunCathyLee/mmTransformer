@@ -43,8 +43,8 @@ _TOPN_SLOT_PRIORITY = {s: r for r, s in enumerate([0, 2, 5, 1, 4, 7, 3, 6])}
 SLOT_WEIGHTS = [0.4944, 0.0411, 0.0935, 0.0074, 0.0002, 0.5559, 0.0000, 0.1179]
 
 # ------------------------------------------------------------------
-# Full 9-channel extra feature indices (same semantics as before)
-# [0:dx, 1:dy, 2:dvx, 3:dvy, 4:ax, 5:ay, 6:lc_state, 7:lit, 8:lis,
+# Full 13-channel neighbor feature indices
+# [0:dx, 1:dy, 2:dvx, 3:dvy, 4:ax, 5:ay, 6:lc_state, 7:volume, 8:size_bin,
 #  9:gate, 10:I_x, 11:I_y, 12:I]
 # Total full channels = 13
 # ------------------------------------------------------------------
@@ -53,6 +53,7 @@ EXTRA_FEATURE_MAP = {
     'baseline': [0, 1, 2, 3, 4, 5],
     'importance': [0, 1, 2, 3, 4, 5, 12],
     'Iy': [0, 1, 2, 3, 4, 5, 11],
+    'dimI': [0, 1, 2, 3, 4, 5, 8, 11],
 }
 # fmt: on
 
@@ -206,16 +207,44 @@ def transform_coord_vec(coords, theta, center):
     return np.dot(coords_rel, rot_mat.T)
 
 # ==============================================================================
-# 7. Per-neighbor feature computation
+# 7. Vehicle size bin  (ported from neighformer preprocess.py)
+# ==============================================================================
+# Bin edges for width * length * height_est (m³): [12, 20, 90, 150]
+# Bin values: 0 (소형차) ~ 4 (대형 트럭)
+_VOLUME_BIN_EDGES = [12.0, 20.0, 90.0, 150.0]  # 4 inner cuts → 5 bins
+
+
+def _volume_bin(phys_length: float, phys_width: float, vehicle_class: str) -> Tuple[float, float]:
+    """Return (size bin index 0~4, raw volume m³) for a vehicle.
+
+    height is estimated from vehicle class and physical length:
+      Car:   length < 4.5m → 1.45m,  < 5.0m → 1.70m,  >= 5.0m → 1.90m
+      Truck: length < 12.0m → 2.75m, >= 12.0m → 3.75m
+    """
+    if vehicle_class == "Car":
+        if phys_length < 4.5:   height = 1.45
+        elif phys_length < 5.0: height = 1.70
+        else:                   height = 1.90
+    else:
+        height = 2.75 if phys_length < 12.0 else 3.75
+    volume = phys_width * phys_length * height
+    for i, edge in enumerate(_VOLUME_BIN_EDGES):
+        if volume < edge:
+            return float(i), volume
+    return 4.0, volume
+
+
+# ==============================================================================
+# 8. Per-neighbor feature computation
 #    Full 13-channel output:
-#    [dx, dy, dvx, dvy, ax, ay, lc_state, lit, lis, gate, I_x, I_y, I]
+#    [dx, dy, dvx, dvy, ax, ay, lc_state, volume, size_bin, gate, I_x, I_y, I]
 #
-#    Key differences from old compute_extra_features_vec:
-#      - LIT: uses bumper-to-bumper gap (vehicle lengths considered), direction-aware denom
-#      - LIS: discrete binning of LIT via LIS_BINS
-#      - Importance: I_x, I_y, I computed from (lis|lit), delta_lane, lc_state
-#      - gate: based on I threshold OR top-N (post-processed); LIT window kept as fallback
-#      - lc_state: v1~v4 selectable (v3 default, matching neighformer)
+#    - volume: physical vehicle volume  width * length * height_est  (m³)
+#    - size_bin: vehicle size bin (0~4) based on volume
+#    - LIT/LIS are computed internally for importance only (not stored)
+#    - Importance: I_x, I_y, I computed from (lis|lit), delta_lane, lc_state
+#    - gate: based on I threshold OR top-N (post-processed)
+#    - lc_state: v1~v4 selectable (v4 default, matching neighformer)
 #
 #    Called once per (neighbor slot, timestep).
 # ==============================================================================
@@ -352,9 +381,10 @@ def process_recording(rec_id: str, raw_dir: Path, temp_dir: Path, args):
     if "laneId" not in tracks.columns: tracks["laneId"] = 0
 
     # vehicle-level lookups
-    vid_to_dd = dict(zip(tmeta["id"].astype(int), tmeta["drivingDirection"].astype(int)))
-    vid_to_w  = dict(zip(tmeta["id"].astype(int), tmeta["width"].astype(float)))   # longitudinal length in highD
-    vid_to_h  = dict(zip(tmeta["id"].astype(int), tmeta["height"].astype(float)))  # lateral width
+    vid_to_dd    = dict(zip(tmeta["id"].astype(int), tmeta["drivingDirection"].astype(int)))
+    vid_to_w     = dict(zip(tmeta["id"].astype(int), tmeta["width"].astype(float)))   # longitudinal length in highD
+    vid_to_h     = dict(zip(tmeta["id"].astype(int), tmeta["height"].astype(float)))  # lateral width
+    vid_to_class = dict(zip(tmeta["id"].astype(int), tmeta["class"].astype(str)))     # vehicle class (Car/Truck)
 
     # ── Raw arrays ───────────────────────────────────────────────────────────
     frame   = tracks["frame"].astype(np.int32).to_numpy()
@@ -575,8 +605,12 @@ def process_recording(rec_id: str, raw_dir: Path, temp_dir: Path, args):
             if num_extra > 0:
                 # Ego vs itself: dx=dy=0, compute full 13-ch feature and slice
                 full_ego = np.zeros((T_H, FULL_DIM), np.float32)
+                ego_class = vid_to_class.get(v, "Car")
+                ego_phys_l = float(vid_to_w.get(v, 0.0))
+                ego_phys_w = float(vid_to_h.get(v, 0.0))
+                ego_size_bin, ego_volume = _volume_bin(ego_phys_l, ego_phys_w, ego_class)
                 for ti in range(T_H):
-                    lc_s, lit_v, lis_v, gate_v, ix_v, iy_v, i_v = compute_nb_features_scalar(
+                    lc_s, _lit_v, _lis_v, gate_v, ix_v, iy_v, i_v = compute_nb_features_scalar(
                         0.0, 0.0,
                         0.0, 0.0,
                         rot_ego_accs[ti, 0], rot_ego_accs[ti, 1],
@@ -591,7 +625,7 @@ def process_recording(rec_id: str, raw_dir: Path, temp_dir: Path, args):
                     )
                     full_ego[ti] = [0.0, 0.0, 0.0, 0.0,
                                     rot_ego_accs[ti, 0], rot_ego_accs[ti, 1],
-                                    lc_s, lit_v, lis_v, gate_v, ix_v, iy_v, i_v]
+                                    lc_s, ego_volume, ego_size_bin, gate_v, ix_v, iy_v, i_v]
                 hist_tensor[0, :, 4:] = full_ego[:, extra_indices]
 
             fut_tensor[0, :, :2] = ego_fut_rel
@@ -635,6 +669,10 @@ def process_recording(rec_id: str, raw_dir: Path, temp_dir: Path, args):
                     continue
 
                 len_nb = float(vid_to_w.get(nid, 0.0))
+                nb_class  = vid_to_class.get(nid, "Car")
+                nb_phys_l = float(vid_to_w.get(nid, 0.0))   # CSV width = physical length
+                nb_phys_w = float(vid_to_h.get(nid, 0.0))   # CSV height = physical width
+                nb_size_bin, nb_volume = _volume_bin(nb_phys_l, nb_phys_w, nb_class)
 
                 # Determine slot index ki for this neighbor (from obs-time slot)
                 ki_nb = next((ki for ki in range(K) if int(ids8_obs[ki]) == nid), 0)
@@ -681,7 +719,7 @@ def process_recording(rec_id: str, raw_dir: Path, temp_dir: Path, args):
 
                     delta_lane = abs(nb_lane - int(ego_lane_arr[ti]))
 
-                    lc_s, lit_v, lis_v, gate_v, ix_v, iy_v, i_v = compute_nb_features_scalar(
+                    lc_s, _lit_v, _lis_v, gate_v, ix_v, iy_v, i_v = compute_nb_features_scalar(
                         dx_rot, dy_rot, dvx_rot, dvy_rot,
                         ax_rot, ay_rot,
                         nb_yv       = nb_yv_raw,
@@ -696,7 +734,7 @@ def process_recording(rec_id: str, raw_dir: Path, temp_dir: Path, args):
 
                     full_nb[ti] = [dx_rot, dy_rot, dvx_rot, dvy_rot,
                                    ax_rot, ay_rot,
-                                   lc_s, lit_v, lis_v, gate_v, ix_v, iy_v, i_v]
+                                   lc_s, nb_volume, nb_size_bin, gate_v, ix_v, iy_v, i_v]
                     nb_mask_ti[ti] = True
 
                 if not nb_mask_ti.any():
