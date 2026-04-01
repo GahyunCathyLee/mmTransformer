@@ -10,7 +10,7 @@ exp:
 # =========================
 data:
   batch_size: 1024
-  num_workers: 64
+  num_workers: 24
 
   train:
     processed_data_path: 'highD/dimI/train.h5'
