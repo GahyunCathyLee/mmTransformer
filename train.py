@@ -60,8 +60,9 @@ def set_seed(seed: int):
 # Dataset
 # ──────────────────────────────────────────────────────────────────────────────
 class HighDDataset(Dataset):
-    def __init__(self, h5_path: str, map_path: str):
+    def __init__(self, h5_path: str, map_path: str, return_meta: bool = False):
         print(f"  [Dataset] {h5_path}")
+        self.return_meta = return_meta
         with open(map_path, 'rb') as f:
             self.map_data = pickle.load(f)['Map']
 
@@ -75,6 +76,14 @@ class HighDDataset(Dataset):
             lane_ids         = f['LANE_ID'][:]
             city_names       = [c.decode('utf-8') if isinstance(c, bytes) else str(c)
                                 for c in f['CITY_NAME'][:]]
+            if return_meta and 'META_REC' in f:
+                self.meta_rec   = f['META_REC'][:]
+                self.meta_track = f['META_TRACK'][:]
+                self.meta_frame = f['META_FRAME'][:]
+            else:
+                self.meta_rec = self.meta_track = self.meta_frame = None
+                if return_meta:
+                    print("[WARN] h5 파일에 META 정보가 없습니다. 전처리를 다시 실행하세요.")
 
         N, max_lanes = lane_ids.shape
         lane_tensor = np.zeros((N, max_lanes, 10, 5), dtype=np.float32)
@@ -90,7 +99,7 @@ class HighDDataset(Dataset):
         return len(self.hist)
 
     def __getitem__(self, idx):
-        return {
+        item = {
             'HISTORY':     self.hist[idx],
             'FUTURE':      self.fut[idx],
             'POS':         self.pos[idx],
@@ -99,6 +108,11 @@ class HighDDataset(Dataset):
             'NORM_CENTER': self.norm_center[idx],
             'THETA':       self.theta[idx],
         }
+        if self.return_meta and self.meta_rec is not None:
+            item['META_REC']   = int(self.meta_rec[idx])
+            item['META_TRACK'] = int(self.meta_track[idx])
+            item['META_FRAME'] = int(self.meta_frame[idx])
+        return item
 
 
 # ──────────────────────────────────────────────────────────────────────────────

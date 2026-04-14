@@ -8,14 +8,17 @@ cond / seed / 데이터 경로 / 체크포인트 위치는 모두 config 에서 
     python evaluate_mmT.py --config configs/c0_seed42.yaml
     python evaluate_mmT.py --config configs/c0_seed42.yaml --split val
     python evaluate_mmT.py --config configs/c0_seed42.yaml --measure_time
+    python evaluate_mmT.py --config configs/c0_seed42.yaml --scenario_labels data/scenario_labels.csv
 """
 
 import argparse
 import csv
 import time
 from pathlib import Path
+from collections import defaultdict
 
 import numpy as np
+import pandas as pd
 import torch
 from torch.amp import autocast
 from torch.utils.data import DataLoader
@@ -36,9 +39,77 @@ from train import (
 TARGET_HZ = 3.0   # preprocess_mmT.py TARGET_FPS
 
 
+# ─────────────────────────────────────────────────────────��────────────────────
+# Scenario label helpers
+# ────────────────────────────────────────────────────────────────────────────��─
+
+def load_scenario_labels(path):
+    path = Path(path)
+    if not path.exists():
+        print(f"[WARN] scenario_labels not found: {path}")
+        return None
+    df = pd.read_csv(path)
+    required = {"recordingId", "trackId", "t0_frame"}
+    missing = required - set(df.columns)
+    if missing:
+        print(f"[WARN] scenario_labels missing columns {missing}")
+        return None
+    has_event = "event_label" in df.columns
+    has_state = "state_label" in df.columns
+    if not has_event and not has_state:
+        print("[WARN] scenario_labels has no event_label/state_label")
+        return None
+    lut = {}
+    for row in df.itertuples(index=False):
+        key = (int(row.recordingId), int(row.trackId), int(row.t0_frame))
+        lut[key] = {
+            "event_label": getattr(row, "event_label", None) if has_event else None,
+            "state_label": getattr(row, "state_label", None) if has_state else None,
+        }
+    print(f"[INFO] Loaded scenario labels: {len(lut):,} entries from {path}")
+    return lut
+
+
+def _sep(widths, left="+", mid="+", right="+", fill="-"):
+    return left + mid.join(fill * w for w in widths) + right
+
+
+def print_scenario_results(stats, label_type):
+    if not stats:
+        return
+    rows = sorted(stats.items(), key=lambda x: (x[0] == "unknown", x[0]))
+    c_lbl = max(len(lbl) for lbl, _ in rows)
+    c_lbl = max(c_lbl, len(label_type)) + 2
+    c_n = 9
+    c_m = 11
+    ws = [c_lbl, c_n, c_m, c_m, c_m]
+
+    print(f"\n====== Scenario Results [{label_type}] ======")
+    print(_sep(ws))
+    print(f"|{label_type:^{c_lbl}}|{'n':^{c_n}}"
+          f"|{'ADE':^{c_m}}|{'FDE':^{c_m}}|{'RMSE':^{c_m}}|")
+    print(_sep(ws))
+
+    for lbl, (sa, sf, sr, n) in rows:
+        if n == 0:
+            continue
+        print(f"|{lbl:^{c_lbl}}|{n:^{c_n},}"
+              f"|{sa/n:^{c_m}.4f}|{sf/n:^{c_m}.4f}|{sr/n:^{c_m}.4f}|")
+    print(_sep(ws))
+
+    total_sa = sum(v[0] for v in stats.values())
+    total_sf = sum(v[1] for v in stats.values())
+    total_sr = sum(v[2] for v in stats.values())
+    total_n = sum(v[3] for v in stats.values())
+    N = max(1, total_n)
+    print(f"|{'Total':^{c_lbl}}|{total_n:^{c_n},}"
+          f"|{total_sa/N:^{c_m}.4f}|{total_sf/N:^{c_m}.4f}|{total_sr/N:^{c_m}.4f}|")
+    print(_sep(ws))
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Metrics
-# ──────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────��────
 def compute_metrics_detailed(pred_trajs: torch.Tensor,
                               gt_trajs:  torch.Tensor) -> dict:
     """
@@ -70,9 +141,9 @@ def compute_metrics_detailed(pred_trajs: torch.Tensor,
             'RMSE': rmse_overall, **rmse_at}
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────���───────────────────────────
 # Inference latency
-# ──────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────��───────────────────────────────────────
 def measure_inference_time(model, dataset: HighDDataset,
                             device: torch.device, num_iters: int = 10_000):
     model.eval()
@@ -81,7 +152,7 @@ def measure_inference_time(model, dataset: HighDDataset,
               for k, v in sample.items() if isinstance(v, torch.Tensor)}
 
     latencies = []
-    print(f"\n⏱  Inference latency  ({num_iters:,} iters, batch=1)")
+    print(f"\nInference latency  ({num_iters:,} iters, batch=1)")
     with torch.no_grad():
         for _ in range(100):    # warm-up
             with autocast(device_type='cuda' if device.type == 'cuda' else 'cpu'):
@@ -102,10 +173,11 @@ def measure_inference_time(model, dataset: HighDDataset,
     return {'avg': lat.mean(), 'min': lat.min(), 'max': lat.max(), 'std': lat.std()}
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────���─────────────────────
 # Evaluate
 # ──────────────────────────────────────────────────────────────────────────────
-def evaluate(cfg: dict, split: str, measure_time: bool, output_dir: Path):
+def evaluate(cfg: dict, split: str, measure_time: bool, output_dir: Path,
+             scenario_labels_path: str = None):
     exp_cfg   = cfg['exp']
     data_cfg  = cfg['data']
     train_cfg = cfg['train']
@@ -121,7 +193,7 @@ def evaluate(cfg: dict, split: str, measure_time: bool, output_dir: Path):
     h5_path  = data_cfg[split]['processed_data_path']
     map_path = data_cfg[split]['processed_maps_path']
 
-    # ── 체크포인트 경로  (train_mmT.py 와 동일한 규칙: ckpt_dir / config_stem) ──
+    # ── 체크포인트 경로 ──
     ckpt_path = Path(train_cfg['ckpt_dir']) / cfg['_config_stem'] / "best.pt"
     if not ckpt_path.exists():
         raise FileNotFoundError(f"체크포인트를 찾을 수 없습니다: {ckpt_path}")
@@ -133,15 +205,21 @@ def evaluate(cfg: dict, split: str, measure_time: bool, output_dir: Path):
     print(f"  ckpt={ckpt_path}")
     print(f"{'='*60}")
 
-    # ── Dataset ───────────────────────────────────────────────────────────────
-    ds = HighDDataset(h5_path, map_path)
+    # ── Scenario labels ──────────────────────────────────────────────��───────
+    labels_lut = None
+    if scenario_labels_path and not measure_time:
+        labels_lut = load_scenario_labels(scenario_labels_path)
+
+    # ── Dataset ─────────────────────────────���─────────────────────────────────
+    need_meta = labels_lut is not None
+    ds = HighDDataset(h5_path, map_path, return_meta=need_meta)
 
     batch_size  = data_cfg.get('batch_size', 512)
     num_workers = data_cfg.get('num_workers', 8)
     loader = DataLoader(ds, batch_size=batch_size, shuffle=False,
                         num_workers=num_workers, pin_memory=True)
 
-    # ── Model ─────────────────────────────────────────────────────────────────
+    # ── Model ──────────────────────────���──────────────────────────────────────
     model = build_model(cfg, device)
     ckpt  = torch.load(ckpt_path, map_location=device)
     state = (ckpt.get('model_state_dict')
@@ -152,20 +230,28 @@ def evaluate(cfg: dict, split: str, measure_time: bool, output_dir: Path):
     print(f"  체크포인트 로드 완료 (epoch={ckpt.get('epoch', '?')}  "
           f"val_rmse={ckpt.get('val_rmse', float('nan')):.4f})")
 
-    # ── Inference time measurement ────────────────────────────────────────────
+    # ── Inference time measurement ──────────────────────────────���─────────────
     if measure_time:
         measure_inference_time(model, ds, device)
         return
 
     model = torch.compile(model)
 
-    # ── Evaluation loop ───────────────────────────────────────────────────────
+    # ── Evaluation loop ─────────────────────────────────��─────────────────────
     metric_keys = ['minADE', 'minFDE', 'RMSE'] + [f'RMSE@{s}s' for s in range(1, 6)]
     accum = {k: 0.0 for k in metric_keys}
     total = 0
 
+    ev_stats = defaultdict(lambda: [0.0, 0.0, 0.0, 0])
+    st_stats = defaultdict(lambda: [0.0, 0.0, 0.0, 0])
+
     with torch.no_grad():
         for batch in tqdm(loader, desc=f"  Evaluating [{split}]"):
+            # Extract meta before moving tensors to device
+            meta_recs   = batch.pop('META_REC', None)
+            meta_tracks = batch.pop('META_TRACK', None)
+            meta_frames = batch.pop('META_FRAME', None)
+
             for k, v in batch.items():
                 if isinstance(v, torch.Tensor):
                     batch[k] = v.to(device, non_blocking=True)
@@ -177,9 +263,28 @@ def evaluate(cfg: dict, split: str, measure_time: bool, output_dir: Path):
             target_gt   = batch['FUTURE'][:, 0, :, :2]                  # [B, T, 2]
 
             metrics = compute_metrics_detailed(target_pred, target_gt)
+            B = target_gt.size(0)
             for k in metric_keys:
                 accum[k] += metrics[k].sum().item()
-            total += target_gt.size(0)
+            total += B
+
+            # Per-scenario accumulation
+            if labels_lut is not None and meta_recs is not None:
+                ade_np  = metrics['minADE'].cpu().numpy()
+                fde_np  = metrics['minFDE'].cpu().numpy()
+                rmse_np = metrics['RMSE'].cpu().numpy()
+                for i in range(B):
+                    key = (int(meta_recs[i]), int(meta_tracks[i]), int(meta_frames[i]))
+                    lab = labels_lut.get(key)
+                    if lab is None:
+                        continue
+                    ev = lab.get("event_label") or "unknown"
+                    st = lab.get("state_label") or "unknown"
+                    for acc, lbl in ((ev_stats, ev), (st_stats, st)):
+                        acc[lbl][0] += float(ade_np[i])
+                        acc[lbl][1] += float(fde_np[i])
+                        acc[lbl][2] += float(rmse_np[i])
+                        acc[lbl][3] += 1
 
     final = {k: accum[k] / total for k in metric_keys}
 
@@ -192,7 +297,13 @@ def evaluate(cfg: dict, split: str, measure_time: bool, output_dir: Path):
     print(f"  RMSE@t  : " + "  ".join(
         f"{s}s={final[f'RMSE@{s}s']:.4f}" for s in range(1, 6)))
 
-    # ── CSV 저장 ──────────────────────────────────────────────────────────────
+    # ── Scenario results ──────────────────────���───────────────────────────────
+    if ev_stats:
+        print_scenario_results(ev_stats, label_type="Event")
+    if st_stats:
+        print_scenario_results(st_stats, label_type="State")
+
+    # ── CSV 저장 ────────────────────────────────��─────────────────────────────
     output_dir.mkdir(parents=True, exist_ok=True)
     csv_path = output_dir / f"{cfg['_config_stem']}_{split}.csv"
     with open(csv_path, 'w', newline='') as f:
@@ -207,7 +318,7 @@ def evaluate(cfg: dict, split: str, measure_time: bool, output_dir: Path):
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Entry point
-# ──────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────���───────────────────────────────────
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--config',       type=str, required=True,
@@ -219,8 +330,11 @@ if __name__ == '__main__':
                         help='추론 시간 측정 모드 (batch=1, 10k iters)')
     parser.add_argument('--output_dir',   type=str, default='results',
                         help='CSV 결과 저장 디렉토리')
+    parser.add_argument('--scenario_labels', type=str, default=None,
+                        help='Path to scenario_labels.csv for per-scenario breakdown')
     args = parser.parse_args()
 
     cfg = load_config_data(args.config)
     cfg['_config_stem'] = Path(args.config).stem   # e.g. "c0_seed42"
-    evaluate(cfg, args.split, args.measure_time, Path(args.output_dir))
+    evaluate(cfg, args.split, args.measure_time, Path(args.output_dir),
+             args.scenario_labels)

@@ -42,6 +42,43 @@ _TOPN_SLOT_PRIORITY = {s: r for r, s in enumerate([0, 2, 5, 1, 4, 7, 3, 6])}
 # Empirical slot weights (mean I per slot)
 SLOT_WEIGHTS = [0.4944, 0.0411, 0.0935, 0.0074, 0.0002, 0.5559, 0.0000, 0.1179]
 
+# Conditional slot weights derived from SlotWeightProbe models (mean softmax per slot).
+# Used when --slot_importance_conditional is set.
+
+# No-LC case: weights by ego lane level  (0=leftmost/fast, 1=middle, 2=rightmost/slow)
+SLOT_WEIGHTS_BY_LANE_LEVEL = [
+    [0.4657, 0.0163, 0.0000, 0.0000, 0.0000, 0.4357, 0.0035, 0.0788],  # ll0 leftmost
+    [0.4240, 0.0346, 0.3347, 0.0197, 0.1859, 0.0007, 0.0002, 0.0001],  # ll1 middle
+    [0.3846, 0.0141, 0.3593, 0.0345, 0.2070, 0.0000, 0.0000, 0.0000],  # ll2 rightmost
+]
+
+# LC-in-history case: pre-LC weights per lc_type (0-5)
+SLOT_WEIGHTS_PRE_LC = [
+    [0.0000, 0.0037, 0.0000, 0.0000, 0.0000, 0.2718, 0.1157, 0.6089],  # lct0 leftmost→middle
+    [0.7023, 0.1658, 0.0000, 0.0000, 0.0000, 0.1251, 0.0049, 0.0019],  # lct1 leftmost→rightmost
+    [0.3170, 0.0117, 0.0033, 0.0003, 0.0005, 0.5215, 0.0168, 0.1289],  # lct2 middle→leftmost
+    [0.0367, 0.0057, 0.4062, 0.1076, 0.4435, 0.0000, 0.0000, 0.0001],  # lct3 middle→rightmost
+    [0.9996, 0.0002, 0.0001, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000],  # lct4 rightmost→leftmost
+    [0.0048, 0.0000, 0.5762, 0.1229, 0.2962, 0.0000, 0.0000, 0.0000],  # lct5 rightmost→middle
+]
+
+# LC-in-history case: post-LC weights per lc_type (0-5)
+SLOT_WEIGHTS_POST_LC = [
+    [0.0017, 0.0074, 0.0026, 0.0011, 0.0109, 0.4849, 0.0611, 0.4303],  # lct0 leftmost→middle
+    [0.0478, 0.0078, 0.7227, 0.0393, 0.1825, 0.0000, 0.0000, 0.0000],  # lct1 leftmost→rightmost
+    [0.8647, 0.0680, 0.0000, 0.0000, 0.0000, 0.0527, 0.0042, 0.0103],  # lct2 middle→leftmost
+    [0.0557, 0.9204, 0.0001, 0.0001, 0.0237, 0.0000, 0.0000, 0.0000],  # lct3 middle→rightmost
+    [0.0002, 0.0001, 0.0000, 0.0000, 0.0000, 0.9557, 0.0427, 0.0013],  # lct4 rightmost→leftmost
+    [0.0125, 0.0334, 0.0001, 0.0016, 0.0006, 0.2424, 0.0296, 0.6799],  # lct5 rightmost→middle
+]
+
+# (from_level, to_level) → lc_type
+_LC_TYPE_MAP_LEVEL: Dict[Tuple[int, int], int] = {
+    (0, 1): 0, (0, 2): 1,
+    (1, 0): 2, (1, 2): 3,
+    (2, 0): 4, (2, 1): 5,
+}
+
 # ------------------------------------------------------------------
 # Full 13-channel neighbor feature indices
 # [0:dx, 1:dy, 2:dvx, 3:dvy, 4:ax, 5:ay, 6:lc_state, 7:volume, 8:size_bin,
@@ -147,6 +184,74 @@ def _apply_topn_gate(nb_row: np.ndarray, mask_row: np.ndarray, n: int) -> None:
             nb_row[k, 11] = 0.0
             nb_row[k, 12] = 0.0
 
+
+def _lane_id_to_level(lid: int, dd: int, sorted_lids: List[int], post_flip: bool) -> int:
+    """lane_id → lane_level (0=leftmost/fast, 1=middle, 2=rightmost/slow)."""
+    n = len(sorted_lids)
+    if n == 0 or lid not in sorted_lids:
+        return -1
+    idx = sorted_lids.index(lid)
+    if n == 1:
+        return 1
+    if post_flip or dd == 2:
+        if idx == 0:     return 0
+        if idx == n - 1: return 2
+        return 1
+    else:  # dd=1, no flip
+        if idx == 0:     return 2
+        if idx == n - 1: return 0
+        return 1
+
+
+def _ego_lc_context(
+    ego_lane_arr: np.ndarray,
+    dd: int,
+    lane_ids_per_dd: Dict[int, List[int]],
+    post_flip: bool,
+) -> Tuple[int, Optional[int], int]:
+    """history window 내 ego LC 상태를 판단한다.
+
+    Returns (lane_level, lc_frame_ti, lc_type)
+      lane_level  : 0/1/2 (no-LC, ego의 t0 차선), -2 (LC in history), -1 (unknown)
+      lc_frame_ti : LC가 처음 일어난 hist frame 인덱스 (None = no LC)
+      lc_type     : 0-5  (-1 = no LC or unknown)
+    """
+    sorted_lids = lane_ids_per_dd.get(dd, [])
+    lc_frame_ti: Optional[int] = None
+    lc_type = -1
+    for ti in range(1, len(ego_lane_arr)):
+        if ego_lane_arr[ti] != ego_lane_arr[ti - 1]:
+            lc_frame_ti = ti
+            from_lvl = _lane_id_to_level(int(ego_lane_arr[ti - 1]), dd, sorted_lids, post_flip)
+            to_lvl   = _lane_id_to_level(int(ego_lane_arr[ti]),     dd, sorted_lids, post_flip)
+            lc_type  = _LC_TYPE_MAP_LEVEL.get((from_lvl, to_lvl), -1)
+            break
+    if lc_frame_ti is None:
+        lane_level = _lane_id_to_level(int(ego_lane_arr[-1]), dd, sorted_lids, post_flip)
+    else:
+        lane_level = -2
+    return lane_level, lc_frame_ti, lc_type
+
+
+def _get_slot_weight(
+    ki: int,
+    ti: int,
+    lane_level: int,
+    lc_frame_ti: Optional[int],
+    lc_type: int,
+) -> float:
+    """slot ki / timestep ti에 대응하는 조건부 slot weight를 반환."""
+    if lc_frame_ti is not None and lc_type >= 0:
+        if ti < lc_frame_ti:
+            return SLOT_WEIGHTS_PRE_LC[lc_type][ki]
+        else:
+            return SLOT_WEIGHTS_POST_LC[lc_type][ki]
+    elif 0 <= lane_level <= 2:
+        return SLOT_WEIGHTS_BY_LANE_LEVEL[lane_level][ki]
+    else:
+        return SLOT_WEIGHTS[ki]  # fallback
+
+
 # ==============================================================================
 # 5. Argument Parsing
 # ==============================================================================
@@ -188,6 +293,8 @@ def parse_args():
                         help="If set, gate=0 neighbors are zeroed in hist_tensor and excluded from valid count")
     parser.add_argument("--slot_importance", type=float, default=0.0, dest="slot_importance_alpha",
                         help="Slot importance boost: I_new = min(I*(1+alpha*w_slot), 1.0). 0.0=disabled")
+    parser.add_argument("--slot_importance_conditional", action="store_true", default=False,
+                        help="use lane-level/pre-LC/post-LC conditional slot weights")
 
     # lc_state version
     parser.add_argument("--lc_version", default="v4", choices=["v1", "v2", "v3", "v4"],
@@ -260,6 +367,11 @@ def compute_nb_features_scalar(
     len_nb: float,         # neighbor vehicle length
     delta_lane: int,       # |nb_lane_id - ego_lane_id|
     args,
+    # per-sample conditional slot weight context (ignored when slot_importance_conditional=False)
+    _lc_lane_lv: int = -1,
+    _lc_frame_ti: Optional[int] = None,
+    _lc_type: int = -1,
+    _ti: int = 0,
 ) -> Tuple[float, float, float, float, float, float, float, float, float]:
     """
     Returns (lc_state, lit, lis, gate, I_x, I_y, I_total)
@@ -344,7 +456,11 @@ def compute_nb_features_scalar(
 
     # ── Slot importance boost ────────────────────────────────────────────────
     if args.slot_importance_alpha > 0.0:
-        i_total = min(i_total * (1.0 + args.slot_importance_alpha * SLOT_WEIGHTS[ki]), 1.0)
+        if args.slot_importance_conditional:
+            w_slot = _get_slot_weight(ki, _ti, _lc_lane_lv, _lc_frame_ti, _lc_type)
+        else:
+            w_slot = SLOT_WEIGHTS[ki]
+        i_total = min(i_total * (1.0 + args.slot_importance_alpha * w_slot), 1.0)
 
     # ── Gate (threshold; top-N applied later per timestep) ──────────────────
     if args.gate_theta > 0.0:
@@ -499,6 +615,13 @@ def process_recording(rec_id: str, raw_dir: Path, temp_dir: Path, args):
         per_vid_rows[v] = rows_arr
         per_vid_frame_to_row[v] = {int(frame[r]): int(r) for r in rows_arr}
 
+    # ── per-dd sorted lane IDs (for conditional slot weights) ────────────────
+    lane_ids_per_dd: Dict[int, List[int]] = {}
+    if args.slot_importance_conditional:
+        for dd_val in [1, 2]:
+            lids = sorted(set(int(x) for x in lane_id[dd == dd_val] if x > 0))
+            lane_ids_per_dd[dd_val] = lids
+
     # ── Map data (lane segments) ─────────────────────────────────────────────
     all_lane_y = sorted(set(
         [float(v) for v in upper_center] + [float(v) for v in lower_center]
@@ -529,6 +652,7 @@ def process_recording(rec_id: str, raw_dir: Path, temp_dir: Path, args):
 
     out_name, out_city, out_hist, out_fut, out_lane_id = [], [], [], [], []
     out_norm, out_theta, out_pos, out_valid = [], [], [], []
+    out_meta_rec, out_meta_track, out_meta_frame = [], [], []
 
     # ── Sliding window loop ──────────────────────────────────────────────────
     for v, v_rows in per_vid_rows.items():
@@ -588,6 +712,16 @@ def process_recording(rec_id: str, raw_dir: Path, temp_dir: Path, args):
 
             ego_lane_arr = lane_id[ego_h_rows].astype(np.int32)   # lane id per hist step
 
+            # ── conditional slot weight context (computed once per sample) ────
+            _lc_lane_lv: int            = -1
+            _lc_frame_ti: Optional[int] = None
+            _lc_type: int               = -1
+            if args.slot_importance_conditional and args.slot_importance_alpha > 0.0:
+                _ego_dd = vid_to_dd.get(v, 2)
+                _lc_lane_lv, _lc_frame_ti, _lc_type = _ego_lc_context(
+                    ego_lane_arr, _ego_dd, lane_ids_per_dd, True  # normalize_flip always True
+                )
+
             # ── Tensor initialisation ──────────────────────────────────────
             # hist_tensor: [MAX_AGENTS, T_H, 4 + num_extra]
             #   channels 0..1 : pos (dx,dy)
@@ -622,6 +756,10 @@ def process_recording(rec_id: str, raw_dir: Path, temp_dir: Path, args):
                         len_nb    = len_ego,
                         delta_lane = 0,
                         args      = args,
+                        _lc_lane_lv  = _lc_lane_lv,
+                        _lc_frame_ti = _lc_frame_ti,
+                        _lc_type     = _lc_type,
+                        _ti          = ti,
                     )
                     full_ego[ti] = [0.0, 0.0, 0.0, 0.0,
                                     rot_ego_accs[ti, 0], rot_ego_accs[ti, 1],
@@ -730,6 +868,10 @@ def process_recording(rec_id: str, raw_dir: Path, temp_dir: Path, args):
                         len_nb      = len_nb,
                         delta_lane  = delta_lane,
                         args        = args,
+                        _lc_lane_lv  = _lc_lane_lv,
+                        _lc_frame_ti = _lc_frame_ti,
+                        _lc_type     = _lc_type,
+                        _ti          = ti,
                     )
 
                     full_nb[ti] = [dx_rot, dy_rot, dvx_rot, dvy_rot,
@@ -785,6 +927,9 @@ def process_recording(rec_id: str, raw_dir: Path, temp_dir: Path, args):
             padded_lane_ids = lane_ids_list + [-1] * (MAX_LANES - valid_lane_num)
 
             out_name.append(f"{rec_id}_{v}_{obs_frame_val}")
+            out_meta_rec.append(int(rec_id))
+            out_meta_track.append(int(v))
+            out_meta_frame.append(int(obs_frame_val))
             out_city.append(city_name)
             out_hist.append(hist_tensor)
             out_fut.append(fut_tensor)
@@ -810,6 +955,9 @@ def process_recording(rec_id: str, raw_dir: Path, temp_dir: Path, args):
             f.create_dataset('THETA',      data=np.array(out_theta,    np.float32), compression="gzip")
             f.create_dataset('POS',        data=np.array(out_pos,      np.float32), compression="gzip")
             f.create_dataset('VALID_LEN',  data=np.array(out_valid,    np.int32),   compression="gzip")
+            f.create_dataset('META_REC',   data=np.array(out_meta_rec,   np.int32))
+            f.create_dataset('META_TRACK', data=np.array(out_meta_track, np.int32))
+            f.create_dataset('META_FRAME', data=np.array(out_meta_frame, np.int32))
 
     return rec_id, map_dict, global_lane_id2idx
 
@@ -913,7 +1061,8 @@ def main():
     print(f"[Config] feature_mode={args.feature_mode}  lc_version={args.lc_version}  "
           f"importance_mode={args.importance_mode}  lis_mode={args.lis_mode}")
     print(f"         gate_theta={args.gate_theta}  gate_topn={args.gate_topn}  "
-          f"gate_mask={args.gate_mask}  slot_alpha={args.slot_importance_alpha}")
+          f"gate_mask={args.gate_mask}  slot_alpha={args.slot_importance_alpha}"
+          + ("  slot_conditional=True" if args.slot_importance_conditional else ""))
     print(f"         eps_gate={args.eps_gate}  t_front={args.t_front}  t_back={args.t_back}")
     print(f"[Output] {out_dir}")
     print(f"Starting multiprocessing with {os.cpu_count()} cores ...")
