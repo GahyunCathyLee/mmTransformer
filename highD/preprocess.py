@@ -611,6 +611,7 @@ def process_recording(rec_id: str, raw_dir: Path, temp_dir: Path, args):
     xv      = xv[keep];      yv      = yv[keep]
     xa      = xa[keep];      ya      = ya[keep]
     lane_id = lane_id[keep]
+    dd      = dd[keep]
     lat_lane_offset_arr = lat_lane_offset_arr[keep]
     lat_lane_width_arr  = lat_lane_width_arr[keep]
 
