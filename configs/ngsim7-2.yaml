@@ -1,0 +1,69 @@
+# =========================
+# EXPERIMENT
+# =========================
+exp:
+  cond: c7
+  feature_mode: dimI   # preprocess_mmT.py --feature_mode baseline
+
+# =========================
+# DATA
+# =========================
+data:
+  batch_size: 1024
+  num_workers: 24
+
+  train:
+    processed_data_path: 'NGSIM/dimI/train.h5'
+    processed_maps_path: 'NGSIM/dimI/map.pkl'
+
+  val:
+    processed_data_path: 'NGSIM/dimI/val.h5'
+    processed_maps_path: 'NGSIM/dimI/map.pkl'
+
+  test:
+    processed_data_path: 'NGSIM/dimI/test.h5'
+    processed_maps_path: 'NGSIM/dimI/map.pkl'
+
+# =========================
+# MODEL
+# =========================
+model:
+  type: 'stacked_transformer'
+
+  history_num_frames: 6    # T_H  (history_sec=2, target_fps=3)
+  future_num_frames: 15    # T_F  (future_sec=5,  target_fps=3)
+  lane_length: 10
+
+  max_lane_num: 6
+  max_agent_num: 9
+
+  # in_channels는 train_mmT.py 가 feature_mode 로부터 자동 계산
+  # baseline: 4 + 6 = 10
+  lane_channels: 7
+  out_channels: 30         # future_num_frames(15) * 2 = 30
+
+  K: 6
+  queries: 6
+  num_guesses: 6
+
+  queries_dim: 64
+  enc_dim: 64
+  aux_task: false
+  increasetime: 3
+
+  subgraph_width: 32
+  num_subgraph_layres: 2
+
+# =========================
+# TRAIN
+# =========================
+train:
+  seed: 1234
+
+  epochs: 100
+  lr: 0.0003
+  weight_decay: 0.0001
+  use_amp: false
+  persistent_workers: true
+
+  ckpt_dir: /content/drive/MyDrive/TrajectoryPrediction/mmTransformer/ckpts
