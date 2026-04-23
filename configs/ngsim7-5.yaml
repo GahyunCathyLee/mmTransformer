@@ -10,7 +10,7 @@ exp:
 # =========================
 data:
   batch_size: 1024
-  num_workers: 24
+  num_workers: 64
 
   train:
     processed_data_path: 'NGSIM/dimI/train.h5'
@@ -66,4 +66,4 @@ train:
   use_amp: false
   persistent_workers: true
 
-  ckpt_dir: /content/drive/MyDrive/TrajectoryPrediction/mmTransformer/ckpts
+  ckpt_dir: ckpts

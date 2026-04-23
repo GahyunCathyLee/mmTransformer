@@ -2,27 +2,27 @@
 # EXPERIMENT
 # =========================
 exp:
-  cond: c0
-  feature_mode: baseline   # preprocess_mmT.py --feature_mode baseline
+  cond: c7
+  feature_mode: dimI   # preprocess_mmT.py --feature_mode baseline
 
 # =========================
 # DATA
 # =========================
 data:
   batch_size: 1024
-  num_workers: 64
+  num_workers: 24
 
   train:
-    processed_data_path: 'NGSIM/baseline/train.h5'
-    processed_maps_path: 'NGSIM/baseline/map.pkl'
+    processed_data_path: 'exiD/dimI/train.h5'
+    processed_maps_path: 'exiD/dimI/map.pkl'
 
   val:
-    processed_data_path: 'NGSIM/baseline/val.h5'
-    processed_maps_path: 'NGSIM/baseline/map.pkl'
+    processed_data_path: 'exiD/dimI/val.h5'
+    processed_maps_path: 'exiD/dimI/map.pkl'
 
   test:
-    processed_data_path: 'NGSIM/baseline/test.h5'
-    processed_maps_path: 'NGSIM/baseline/map.pkl'
+    processed_data_path: 'exiD/dimI/test.h5'
+    processed_maps_path: 'exiD/dimI/map.pkl'
 
 # =========================
 # MODEL
@@ -58,7 +58,7 @@ model:
 # TRAIN
 # =========================
 train:
-  seed: 0
+  seed: 777
 
   epochs: 100
   lr: 0.0003
@@ -66,4 +66,4 @@ train:
   use_amp: false
   persistent_workers: true
 
-  ckpt_dir: ckpts
+  ckpt_dir: /content/drive/MyDrive/TrajectoryPrediction/mmTransformer/ckpts

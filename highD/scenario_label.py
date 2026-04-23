@@ -10,9 +10,8 @@ raw highD CSV에서 lane-change / traffic-state 정보를 추출해 라벨링한
 obs_frame = 히스토리의 마지막 프레임 (native fps 기준)
 window    = [obs_frame - (T_H-1)*ds_stride, obs_frame + T_F*ds_stride]
 
-Event labels (3-class):
-    cut_in          : window 내 LC 발생 + 목표 차선 측 rear/alongside 차량 있음
-    lane_change     : window 내 LC 발생 + 목표 차선 측 rear/alongside 차량 없음
+Event labels (2-class):
+    lane_change     : window 내 LC 발생
     lane_following  : window 내 LC 없음
 
 State labels (2-class):
@@ -259,16 +258,8 @@ def label_event(
     direction = infer_lc_direction(w, lc_frame=lc_frame, K=lc_direction_K)
     out["lc_direction"] = direction if direction is not None else "unknown"
 
-    if direction is None:
-        out["event_label"]               = "lane_change"
-        out["has_adj_rear_or_alongside"] = False
-        return out
-
-    has_adj = check_adjacent_rear_or_alongside(
-        w=w, lc_frame=lc_frame, direction=direction, lookup=lookup, W=W_adj,
-    )
-    out["has_adj_rear_or_alongside"] = bool(has_adj)
-    out["event_label"] = "cut_in" if has_adj else "lane_change"
+    out["has_adj_rear_or_alongside"] = False
+    out["event_label"] = "lane_change"
     return out
 
 
